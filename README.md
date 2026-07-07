@@ -2,11 +2,10 @@
 
 An open GPU/CPU miner for the **Compute Substrate (CSD)** chain, over Stratum v1.
 
-It mines to the [cairn pool](https://pool.cairn-substrate.com) by default — but
-unlike the incumbent miner, the pool is **not** compiled in. `--pool` points it
-anywhere, and you can list several for failover. Your address is your account;
-there is no signup, no phone-home, and **no bundled relay** that follows a
-remote blacklist.
+It mines to the [cairn pool](https://pool.cairn-substrate.com) by default, but
+the pool is **not** compiled in: `--pool` points it anywhere, and you can list
+several for failover. Your address is your account; there is no signup, no
+phone-home, and **no bundled relay** that follows a remote blacklist.
 
 ```
   auto-detects CUDA -> OpenCL -> CPU     multi-endpoint --pool failover
@@ -95,10 +94,7 @@ cargo build --release --features opencl    # + AMD
 Do **not** build with `RUSTFLAGS=-C target-cpu=native` — it disables the
 hand-written SHA-NI path.
 
-## License & provenance
+## License
 
-MIT OR Apache-2.0. cairn-miner is a clean fork of the Compute Substrate pool
-miner **at its v0.1.6 tag** (the last release under MIT/Apache); it reuses none
-of that project's later PolyForm-licensed code. "Compute Substrate" / "CSD" and
-related marks belong to their owners and are used only to state compatibility.
-See `NOTICE`.
+MIT OR Apache-2.0 (see `LICENSE-MIT` and `LICENSE-APACHE`). "Compute Substrate"
+and "CSD" are used only to state chain compatibility.

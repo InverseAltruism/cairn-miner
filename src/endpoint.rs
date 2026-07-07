@@ -1,12 +1,8 @@
 //! Default pool endpoint.
 //!
-//! cairn-miner is the open-pool counterpart to cairn-pool: the default
-//! endpoint below is a plain, greppable constant — no obfuscation — and the
-//! `--pool` flag overrides it freely. Your miner, your choice of pool.
-//!
-//! (The upstream this crate was forked from compiled in an XOR-scrambled
-//! endpoint with no override flag, locking the binary to one pool. We keep
-//! this module only as the home of the *default*.)
+//! cairn-miner is the open-pool counterpart to cairn-pool: the default endpoint
+//! below is a plain, greppable constant — no obfuscation — and the `--pool`
+//! flag overrides it freely. Your miner, your choice of pool.
 
 /// Default Stratum v1 endpoint (`host:port`) used when no `--pool` flag and no
 /// `pool =` config value is given: the public cairn pool.
