@@ -28,17 +28,20 @@ self-updating launcher.
 
 ### Windows — the launcher (recommended)
 
-Download **`cairn-miner-launcher-windows.zip`** from the
-[latest release](https://github.com/InverseAltruism/cairn-miner/releases/latest),
-extract it anywhere, and run **`cairn-miner-launcher.exe`**. The native app lets
-you set your address, pick a backend, **Start/Stop** mining, toggle
-**start-on-login**, and watch live performance — hashrate graph, accepted/rejected
-shares, difficulty, uptime. The miner runs headless behind it (all backends
-bundled; `auto` picks CUDA → OpenCL → CPU).
+Download the single file **`cairn-miner-launcher.exe`** from the
+[latest release](https://github.com/InverseAltruism/cairn-miner/releases/latest)
+and run it. That's the whole install — the miner is **embedded inside the
+launcher**, so there's nothing else to download or unzip.
 
-> Double-clicking a bare `cairn-miner.exe` with no settings just exits — it needs
-> your payout address. The launcher is the friendly way in; if you do run the
-> miner from a terminal, pass `--address <your-addr20>`.
+In the app you: choose a **mode** (GPU only / GPU + CPU / CPU only), tick the
+**GPUs** to mine on (multi-GPU rigs show every card by name), set **CPU
+intensity**, enter your address, then **Start/Stop**. It shows aggregated live
+performance across every card — total hashrate graph, per-worker rows,
+accepted/rejected shares, difficulty, uptime — and a **start-on-login** toggle.
+Each GPU runs as its own worker under one window (no more one-console-per-card).
+
+> Prefer the command line? A bare `cairn-miner.exe` needs `--address <addr20>`;
+> with no address it just exits.
 
 ### Windows (scripted install)
 

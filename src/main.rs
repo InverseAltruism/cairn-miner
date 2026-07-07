@@ -156,7 +156,13 @@ enum Cmd {
 
     /// Probe and print available GPU devices, then exit. Use this when
     /// `--backend auto` keeps falling back to CPU and you want to know why.
-    Devices,
+    Devices {
+        /// Emit a machine-readable JSON device list (unified GPU list with
+        /// per-device backend + index, plus CPU core count). The launcher
+        /// consumes this to populate its device pickers.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Cross-check every available backend against the canonical CPU
     /// sha256d on randomized inputs. Exits 0 if all backends agree, 1
@@ -397,8 +403,8 @@ fn run() -> Result<()> {
         return keygen::run();
     }
 
-    if matches!(cli.cmd, Some(Cmd::Devices)) {
-        return print_devices();
+    if let Some(Cmd::Devices { json }) = cli.cmd {
+        return print_devices(json);
     }
 
     if let Some(Cmd::Bench { nonces }) = cli.cmd {
@@ -669,7 +675,10 @@ fn print_build_features() {
     }
 }
 
-fn print_devices() -> Result<()> {
+fn print_devices(json: bool) -> Result<()> {
+    if json {
+        return print_devices_json();
+    }
     println!("=== cairn-miner devices ===");
     println!();
     println!("build features: cuda={} opencl={}", cfg!(feature = "cuda"), cfg!(feature = "opencl"));
@@ -724,6 +733,74 @@ fn print_devices() -> Result<()> {
     {
         println!("OpenCL: backend not compiled in (build with --features opencl)");
     }
+    Ok(())
+}
+
+/// Machine-readable device list for the launcher: a unified GPU list (each with
+/// its backend + the `--device` index to use) plus the CPU core count. NVIDIA
+/// GPUs are reported once (via CUDA when compiled in) rather than duplicated
+/// through the OpenCL enumeration. Emits a single JSON line on stdout.
+fn print_devices_json() -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct GpuInfo {
+        backend: &'static str,
+        index: usize,
+        name: String,
+    }
+    #[derive(serde::Serialize)]
+    struct CpuInfo {
+        logical_cores: usize,
+    }
+    #[derive(serde::Serialize)]
+    struct DeviceList {
+        gpus: Vec<GpuInfo>,
+        cpu: CpuInfo,
+    }
+
+    // `mut` is only needed when a GPU backend is compiled in.
+    #[allow(unused_mut)]
+    let mut gpus: Vec<GpuInfo> = Vec::new();
+
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(n) = cudarc::driver::CudaContext::device_count() {
+            for i in 0..n as usize {
+                if let Ok(ctx) = cudarc::driver::CudaContext::new(i) {
+                    let name = ctx.name().unwrap_or_else(|_| "NVIDIA GPU".into());
+                    gpus.push(GpuInfo { backend: "cuda", index: i, name });
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "opencl")]
+    {
+        use opencl3::device::{get_all_devices, Device, CL_DEVICE_TYPE_GPU};
+        // Same enumeration the OpenCL backend uses, so the reported index is the
+        // one `--device` expects.
+        if let Ok(devs) = get_all_devices(CL_DEVICE_TYPE_GPU) {
+            for (i, d) in devs.iter().enumerate() {
+                let dev = Device::new(*d);
+                let vendor = dev.vendor().unwrap_or_default();
+                // Skip NVIDIA cards here only if CUDA is compiled in (then they
+                // already appear above); otherwise list them via OpenCL.
+                if cfg!(feature = "cuda") && vendor.to_uppercase().contains("NVIDIA") {
+                    continue;
+                }
+                let name = dev.name().unwrap_or_default();
+                gpus.push(GpuInfo { backend: "opencl", index: i, name });
+            }
+        }
+    }
+
+    let logical_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let list = DeviceList {
+        gpus,
+        cpu: CpuInfo { logical_cores },
+    };
+    println!("{}", serde_json::to_string(&list)?);
     Ok(())
 }
 

@@ -1,31 +1,95 @@
-//! Launcher settings, persisted as the miner's own `config.toml` so the file is
-//! interchangeable between the launcher and a hand-run `cairn-miner --config`.
-//!
-//! Keys mirror `cairn-miner`'s `FileConfig` (snake_case; `pool` may be a single
-//! string or a failover list). The launcher only *models* the common knobs it
-//! exposes in the UI, but on save it preserves every other key already in the
-//! file, so an advanced user's `blocks`/`nonces_per_thread`/etc. survive edits.
+//! Launcher settings: mining mode, which GPUs are selected, CPU intensity, and
+//! identity (address/worker/pool). Persisted as the launcher's own TOML in the
+//! per-user app dir — separate from the miner's `config.toml`, because the
+//! launcher now drives several miner processes with per-device flags rather than
+//! one config file.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use toml::value::{Table, Value};
+use serde::{Deserialize, Serialize};
 
-/// The subset of miner config the launcher UI edits, plus the untouched
-/// remainder of the file for lossless round-tripping.
-#[derive(Clone, Debug)]
+/// Which compute the user wants to mine with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    GpuPlusCpu,
+    GpuOnly,
+    CpuOnly,
+}
+
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::GpuOnly
+    }
+}
+
+impl Mode {
+    pub fn uses_gpu(self) -> bool {
+        matches!(self, Mode::GpuPlusCpu | Mode::GpuOnly)
+    }
+    pub fn uses_cpu(self) -> bool {
+        matches!(self, Mode::GpuPlusCpu | Mode::CpuOnly)
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::GpuPlusCpu => "GPU + CPU",
+            Mode::GpuOnly => "GPU only",
+            Mode::CpuOnly => "CPU only",
+        }
+    }
+    pub const ALL: [Mode; 3] = [Mode::GpuOnly, Mode::GpuPlusCpu, Mode::CpuOnly];
+}
+
+/// How hard the CPU worker runs (mapped to a thread count from the core count).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuIntensity {
+    Light,
+    Medium,
+    Full,
+}
+
+impl Default for CpuIntensity {
+    fn default() -> Self {
+        CpuIntensity::Medium
+    }
+}
+
+impl CpuIntensity {
+    pub fn label(self) -> &'static str {
+        match self {
+            CpuIntensity::Light => "Light",
+            CpuIntensity::Medium => "Medium",
+            CpuIntensity::Full => "Full",
+        }
+    }
+    pub const ALL: [CpuIntensity; 3] =
+        [CpuIntensity::Light, CpuIntensity::Medium, CpuIntensity::Full];
+
+    /// Threads to use given the machine's logical core count. Always leaves at
+    /// least one core free (except tiny machines), and Full keeps 2 for the OS.
+    pub fn threads(self, logical_cores: usize) -> usize {
+        let c = logical_cores.max(1);
+        match self {
+            CpuIntensity::Light => (c / 4).max(1),
+            CpuIntensity::Medium => (c / 2).max(1),
+            CpuIntensity::Full => c.saturating_sub(2).max(1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LauncherConfig {
     pub address: String,
     pub worker: String,
-    /// Endpoints in priority order; empty means "use the miner's built-in
-    /// default" (the public cairn pool).
+    /// Endpoints in priority order; empty = the miner's built-in default pool.
     pub pools: Vec<String>,
-    pub backend: String,
-    pub device: u64,
-    pub cpu_threads: u64,
-    pub reserve: u64,
-    /// Every key from the loaded file, so save() doesn't drop unknown/advanced
-    /// keys. The managed keys above are re-applied over this on save.
-    raw: Table,
+    pub mode: Mode,
+    /// Selected GPU identities as `"<backend>:<index>"` (e.g. `"cuda:0"`), so a
+    /// choice survives restarts and reorderings.
+    pub selected_gpus: Vec<String>,
+    pub cpu_intensity: CpuIntensity,
 }
 
 impl Default for LauncherConfig {
@@ -34,122 +98,41 @@ impl Default for LauncherConfig {
             address: String::new(),
             worker: String::new(),
             pools: Vec::new(),
-            backend: "auto".to_string(),
-            device: 0,
-            cpu_threads: 0,
-            reserve: 4,
-            raw: Table::new(),
+            mode: Mode::default(),
+            selected_gpus: Vec::new(),
+            cpu_intensity: CpuIntensity::default(),
         }
     }
 }
 
 impl LauncherConfig {
-    /// Parse a config from TOML text, filling unset keys with defaults.
-    pub fn from_toml(text: &str) -> Self {
-        let raw: Table = toml::from_str(text).unwrap_or_default();
-        let mut cfg = LauncherConfig {
-            raw: raw.clone(),
-            ..Default::default()
-        };
-        if let Some(s) = raw.get("address").and_then(Value::as_str) {
-            cfg.address = s.to_string();
-        }
-        if let Some(s) = raw.get("worker").and_then(Value::as_str) {
-            cfg.worker = s.to_string();
-        }
-        if let Some(s) = raw.get("backend").and_then(Value::as_str) {
-            cfg.backend = s.to_string();
-        }
-        if let Some(n) = raw.get("device").and_then(Value::as_integer) {
-            cfg.device = n.max(0) as u64;
-        }
-        if let Some(n) = raw.get("cpu_threads").and_then(Value::as_integer) {
-            cfg.cpu_threads = n.max(0) as u64;
-        }
-        if let Some(n) = raw.get("reserve").and_then(Value::as_integer) {
-            cfg.reserve = n.max(0) as u64;
-        }
-        cfg.pools = match raw.get("pool") {
-            Some(Value::String(s)) => vec![s.clone()],
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect(),
-            _ => Vec::new(),
-        };
-        cfg
+    pub fn load(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
-    /// Serialize to TOML, re-applying the managed keys over the preserved
-    /// remainder of the original file.
-    pub fn to_toml(&self) -> String {
-        let mut t = self.raw.clone();
-        set_or_remove_str(&mut t, "address", &self.address);
-        set_or_remove_str(&mut t, "worker", &self.worker);
-        set_or_remove_str(&mut t, "backend", &self.backend);
-        t.insert("device".into(), Value::Integer(self.device as i64));
-        t.insert("cpu_threads".into(), Value::Integer(self.cpu_threads as i64));
-        t.insert("reserve".into(), Value::Integer(self.reserve as i64));
-
-        let clean: Vec<String> = self
-            .pools
-            .iter()
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect();
-        match clean.len() {
-            0 => {
-                t.remove("pool");
-            }
-            1 => {
-                t.insert("pool".into(), Value::String(clean[0].clone()));
-            }
-            _ => {
-                t.insert(
-                    "pool".into(),
-                    Value::Array(clean.into_iter().map(Value::String).collect()),
-                );
-            }
-        }
-        toml::to_string_pretty(&Value::Table(t))
-            .unwrap_or_else(|_| String::new())
-    }
-
-    /// Load from `path`, or return defaults if it's missing/unreadable.
-    pub fn load(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Self::from_toml(&s),
-            Err(_) => Self::default(),
-        }
-    }
-
-    /// Write to `path`, creating parent directories as needed.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, self.to_toml())
+        let text = toml::to_string_pretty(self)
+            .unwrap_or_else(|_| String::new());
+        std::fs::write(path, text)
     }
 }
 
-fn set_or_remove_str(t: &mut Table, key: &str, val: &str) {
-    let v = val.trim();
-    if v.is_empty() {
-        t.remove(key);
-    } else {
-        t.insert(key.into(), Value::String(v.to_string()));
-    }
-}
-
-/// The config path the launcher owns and passes to the miner via `--config`:
-/// `<platform config dir>/cairn-miner/config.toml`, matching the miner's own
-/// platform-dir logic (Windows `%APPDATA%`, else `$XDG_CONFIG_HOME`/`~/.config`).
-pub fn config_path() -> PathBuf {
+/// Per-user app directory: `%APPDATA%\cairn-miner` on Windows, else
+/// `$XDG_CONFIG_HOME/cairn-miner` or `~/.config/cairn-miner`.
+pub fn app_dir() -> PathBuf {
     platform_config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("cairn-miner")
-        .join("config.toml")
+}
+
+pub fn config_path() -> PathBuf {
+    app_dir().join("launcher.toml")
 }
 
 fn platform_config_dir() -> Option<PathBuf> {
@@ -173,49 +156,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_managed_fields() {
-        let cfg = LauncherConfig {
-            address: "03ec5155c0153e5f95fabcc09b6a181465adceb4".into(),
-            worker: "rig-01".into(),
-            pools: vec!["cairn-pool.com:3333".into(), "backup:3333".into()],
-            backend: "cuda".into(),
-            device: 1,
-            cpu_threads: 8,
-            reserve: 2,
-            raw: Table::new(),
-        };
-        let parsed = LauncherConfig::from_toml(&cfg.to_toml());
-        assert_eq!(parsed.address, cfg.address);
-        assert_eq!(parsed.worker, "rig-01");
-        assert_eq!(parsed.pools, cfg.pools);
-        assert_eq!(parsed.backend, "cuda");
-        assert_eq!(parsed.device, 1);
-        assert_eq!(parsed.cpu_threads, 8);
-        assert_eq!(parsed.reserve, 2);
+    fn cpu_intensity_thread_mapping() {
+        assert_eq!(CpuIntensity::Light.threads(16), 4);
+        assert_eq!(CpuIntensity::Medium.threads(16), 8);
+        assert_eq!(CpuIntensity::Full.threads(16), 14);
+        // Never zero, even on tiny machines.
+        assert_eq!(CpuIntensity::Full.threads(1), 1);
+        assert_eq!(CpuIntensity::Light.threads(2), 1);
     }
 
     #[test]
-    fn single_pool_writes_as_string_and_reads_back() {
-        let mut cfg = LauncherConfig::default();
-        cfg.pools = vec!["only:3333".into()];
-        let text = cfg.to_toml();
-        assert!(text.contains("pool = \"only:3333\""));
-        assert_eq!(LauncherConfig::from_toml(&text).pools, vec!["only:3333"]);
+    fn mode_capabilities() {
+        assert!(Mode::GpuPlusCpu.uses_gpu() && Mode::GpuPlusCpu.uses_cpu());
+        assert!(Mode::GpuOnly.uses_gpu() && !Mode::GpuOnly.uses_cpu());
+        assert!(!Mode::CpuOnly.uses_gpu() && Mode::CpuOnly.uses_cpu());
     }
 
     #[test]
-    fn preserves_unknown_advanced_keys() {
-        let text = "blocks = 720\nnonces_per_thread = 8192\naddress = \"abc\"\n";
-        let cfg = LauncherConfig::from_toml(text);
-        let out = cfg.to_toml();
-        assert!(out.contains("blocks = 720"), "advanced key dropped: {out}");
-        assert!(out.contains("nonces_per_thread = 8192"));
-    }
-
-    #[test]
-    fn empty_address_is_omitted_not_blank() {
-        let cfg = LauncherConfig::default();
-        let out = cfg.to_toml();
-        assert!(!out.contains("address ="), "blank address should be omitted: {out}");
+    fn config_round_trips() {
+        let mut c = LauncherConfig::default();
+        c.address = "abc".into();
+        c.mode = Mode::GpuPlusCpu;
+        c.selected_gpus = vec!["cuda:0".into(), "opencl:1".into()];
+        c.cpu_intensity = CpuIntensity::Full;
+        let text = toml::to_string_pretty(&c).unwrap();
+        let back: LauncherConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.address, "abc");
+        assert_eq!(back.mode, Mode::GpuPlusCpu);
+        assert_eq!(back.selected_gpus, vec!["cuda:0", "opencl:1"]);
+        assert_eq!(back.cpu_intensity, CpuIntensity::Full);
     }
 }

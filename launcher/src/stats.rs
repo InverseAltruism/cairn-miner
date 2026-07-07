@@ -11,7 +11,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 /// Mirror of the miner's `stats::StatsSnapshot`. Field names must stay in sync
-/// (there's a serialization-key test on the miner side).
+/// (there's a serialization-key test on the miner side). Some fields are part of
+/// the JSON contract but not all are surfaced in the aggregated UI.
+#[allow(dead_code)]
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct StatsSnapshot {
     pub connected: bool,
@@ -32,6 +34,7 @@ pub struct StatsSnapshot {
 
 impl StatsSnapshot {
     /// Rejected shares as a percentage of all acked shares (0 if none yet).
+    #[allow(dead_code)]
     pub fn reject_pct(&self) -> f64 {
         let total = self.shares_accepted + self.shares_rejected;
         if total == 0 {

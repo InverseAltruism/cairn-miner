@@ -240,9 +240,9 @@ pub fn run_stratum<B: MiningBackend>(
         );
 
         let last_refresh = Instant::now();
-        // A fresh job means a new header; restart the nonce sweep from 0 (the
-        // current xn2 carries over — it's just more coinbase variety).
-        nonce_cursor = 0;
+        // The nonce cursor carries over across jobs — every (header, xn2, nonce)
+        // triple is unique work, so continuing the sweep where it left off is
+        // fine and avoids re-scanning the same low nonces after each job change.
 
         // Inner per-launch loop for THIS job. Each iteration sweeps one bounded
         // nonce chunk (see `chunk_size`), re-derives the coinbase/header from the
