@@ -1,167 +1,104 @@
-# csd-pool-miner
+# cairn-miner
 
-A standalone miner for the **Compute Substrate (CSD)** network. Point it at your
-payout address and it mines to the CSD pool — auto-detecting your GPU (NVIDIA or
-AMD) or falling back to CPU.
+An open GPU/CPU miner for the **Compute Substrate (CSD)** chain, over Stratum v1.
 
-It connects to the pool **by default**: there is no server/pool flag to set. The
-only thing you have to provide is your addr20 (a 40-hex CSD payout address).
+It mines to the [cairn pool](https://pool.cairn-substrate.com) by default — but
+unlike the incumbent miner, the pool is **not** compiled in. `--pool` points it
+anywhere, and you can list several for failover. Your address is your account;
+there is no signup, no phone-home, and **no bundled relay** that follows a
+remote blacklist.
 
-Discord channel for mining stats, updates and support/improvements:
-https://discord.gg/Gr9gCjzC9e
-
-## Install (Windows — one click)
-
-Easiest path — no toolchain, no manual download:
-
-1. Download **`install-csd-miner.bat`** from this repo (or from a release).
-2. Double-click it.
-
-It auto-detects your GPU (NVIDIA / AMD, else CPU), installs the VC++ runtime via
-`winget` if needed, downloads the matching prebuilt binary from the latest
-GitHub Release, asks for your addr20 payout address the first time (and remembers
-it), then starts mining. To force a build: `install-csd-miner.bat nvidia|amd|cpu`.
-
-Prefer to run the binary yourself? Grab the matching
-`csd-pool-miner-<nvidia|amd|cpu>.exe` from
-[Releases](https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest)
-and see [Quick start](#quick-start).
-
-## Install (Ubuntu / Linux — one command)
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | bash
 ```
-
-Auto-detects your GPU (NVIDIA / AMD, else CPU), downloads the matching prebuilt
-binary from the latest GitHub Release, asks for your addr20 the first time (and
-remembers it under `~/.config/csd-pool-miner/`), then starts mining. Force a
-variant by passing it through: `… | bash -s -- nvidia|amd|cpu`.
-
-Piping into `bash` leaves no terminal to prompt on, so supply your addr20 in the
-environment (or as the 2nd arg) the first time:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/install-csd-miner.sh | CSD_ADDR=<YOUR_ADDR20> bash
+  auto-detects CUDA -> OpenCL -> CPU     multi-endpoint --pool failover
+  interleaved SHA-NI CPU path (~2.8x)    no dev fee, no telemetry, no relay
+  Windows / Linux / HiveOS installers    your keys + address never leave the box
 ```
-
-Prefer to run it yourself? Download `csd-pool-miner-linux-<nvidia|amd|cpu>` from
-[Releases](https://github.com/dangraagu/CSD-Mining-pool-public/releases/latest),
-then `chmod +x csd-pool-miner-linux-<variant>` and run it with `--address
-<YOUR_ADDR20>`. For 24/7 rigs, `mine-all-gpus.sh` (every card) and `mine-auto.sh`
-(every card + auto-update) are fetched alongside the installer.
-
-## Requirements
-
-One of:
-
-- **NVIDIA GPU** — a recent NVIDIA driver is enough. The CUDA backend ships a
-  pre-built kernel (PTX) and JITs it through the driver, so **no CUDA Toolkit /
-  nvrtc is required**. Use a build with the `cuda` feature.
-- **AMD / other GPU** — an OpenCL driver/runtime for your card. Use a build with
-  the `opencl` feature.
-- **CPU only** — no GPU or driver required; works out of the box.
-
-The default prebuilt binary is **CPU-only**. For GPU mining, use a release built
-with the matching feature (see [Building](#building)).
 
 ## Quick start
 
-```sh
-csd-pool-miner --address <YOUR_ADDR20>
-```
-
-That's it. The miner will:
-
-1. auto-detect the best backend (tries CUDA → OpenCL → CPU),
-2. connect to the CSD pool,
-3. start submitting shares for `<YOUR_ADDR20>`.
-
-### Choosing a backend
-
-Auto-detect is the default. To force one:
+### Linux (one line)
 
 ```sh
-csd-pool-miner --address <YOUR_ADDR20> --backend auto    # default: cuda -> opencl -> cpu
-csd-pool-miner --address <YOUR_ADDR20> --backend cuda     # NVIDIA
-csd-pool-miner --address <YOUR_ADDR20> --backend opencl   # AMD / other
-csd-pool-miner --address <YOUR_ADDR20> --backend cpu      # CPU only
+curl -fsSL https://raw.githubusercontent.com/InverseAltruism/cairn-miner/master/install.sh | CAIRN_ADDR=<your-addr20> bash
 ```
 
-### Useful extras
+Auto-detects your GPU, installs the matching build (or compiles from source if
+no prebuilt release fits your arch), saves your address, and starts mining. Add
+`--service` to install a systemd/user service, or run `mine-auto.sh` for a
+self-updating launcher.
+
+### Windows (one click)
+
+Download **`install.bat`** from the
+[latest release](https://github.com/InverseAltruism/cairn-miner/releases/latest)
+and double-click it. It detects your GPU, downloads the right `cairn-miner.exe`,
+asks for your address once, and starts mining. `install.bat` (via `install.ps1`)
+also accepts `-Service` to run at logon.
+
+### HiveOS
+
+Flight sheet → Miner: **Custom** →
+- Installation URL: `https://github.com/InverseAltruism/cairn-miner/releases/latest/download/cairn-miner-hiveos.tar.gz`
+- Miner name in config: `cairn-miner`
+- Hash algorithm: `sha256d`
+- Wallet and worker template: `%WAL%`  (your addr20)
+- Pool URL: `pool.cairn-substrate.com:3333`  (or leave blank for the default)
+- Pass: `x`
+
+That's it — standard fields, no dummy pool URL, no exact-name gotchas. Multi-GPU
+rigs are handled per card.
+
+### No wallet yet?
 
 ```sh
-csd-pool-miner devices     # list detected GPUs (handy if auto keeps picking CPU)
-csd-pool-miner selftest    # cross-check every backend against the reference CPU hasher
+cairn-miner newwallet     # generates an addr20 locally; the private key never leaves your machine
 ```
 
-## Config file (optional)
+## Point it at any pool
 
-Instead of passing flags every run, drop a `config.toml` next to the binary, at
-`~/.config/csd-pool-miner/config.toml` (Linux/macOS) or
-`%APPDATA%\csd-pool-miner\config.toml` (Windows), or point at one with `--config
-<path>`. Any explicit CLI flag overrides the file, which overrides the built-in
-defaults. See [`config.example.toml`](config.example.toml) for every key — a
-minimal example:
+```sh
+cairn-miner --address <addr20> --pool your.pool.host:3333
+cairn-miner --address <addr20> --pool a.pool:3333 --pool b.pool:3333   # failover
+cairn-miner --address <addr20> --worker rig-01 --backend cuda
+```
+
+Config file (`~/.config/cairn-miner/config.toml`, or `%APPDATA%\cairn-miner\` on
+Windows) — see `config.example.toml`:
 
 ```toml
-address = "your40charhexaddr20goeshere0000000000000"
-# CPU threads to mine ALONGSIDE the GPU (dual mining). 0 = GPU-only.
-cpu_threads = 0
+address = "your40charaddr20..."
+pool = ["pool.cairn-substrate.com:3333", "backup.example:3333"]
+worker = "rig-01"
+backend = "auto"     # auto | cpu | cuda | opencl
+cpu_threads = 0      # GPU-only by default; raise on a desktop with headroom
 ```
 
-**CPU usage on GPU builds:** by default a GPU build *also* mines on the CPU
-(`cpu_threads = 16`) for extra hashrate, so you'll see high CPU use even while
-the GPU works. To let the GPU do the work and keep your CPU free — recommended
-on laptops, where the CPU and GPU share one power/thermal budget — set
-`cpu_threads = 0` (or pass `--cpu-threads 0`).
+## Backends
 
-## Payouts
+| Backend | Build | Notes |
+|---|---|---|
+| CPU     | default | interleaved SHA-NI batch path — ~2.8x a scalar hasher on Alder Lake (`cairn-miner bench` to measure yours) |
+| CUDA    | `--features cuda`   | NVIDIA; ships a prebuilt PTX and JITs via the driver — no CUDA Toolkit needed at runtime |
+| OpenCL  | `--features opencl` | AMD and other GPUs |
 
-Payouts are **batched hourly by the pool, at the top of every hour (:00)**. Your
-shares accrue continuously; the pool settles all eligible miners together once an
-hour, so you won't see a payout the instant you find a share — wait for the next
-:00 settlement.
+`cairn-miner devices` lists what it can see; `cairn-miner selftest` cross-checks
+every backend against the reference sha256d.
 
-## Where to get an addr20
-
-`--address` is your **addr20** — your CSD payout address: **40 lowercase hex
-characters** (an optional `0x` prefix is accepted).
-
-**No address yet? Create a wallet in one step:**
-
-- **Windows** — download & double-click **`create-wallet.bat`**
-- **Linux** — `curl -fsSL https://raw.githubusercontent.com/dangraagu/CSD-Mining-pool-public/main/create-wallet.sh | bash`
-- **Already have the miner?** — `csd-pool-miner newwallet`
-
-It generates a fresh key locally, prints your **addr20**, and writes it (with the
-private key) to `csd-wallet.txt`. ⚠️ **Back up that file — losing the private key
-means losing access to any coins paid to the address.** The saved key imports into
-a full node with `csd wallet recover` when you want to spend.
-
-Already have a CSD node/wallet? Your existing address works too — it's the same
-one you'd receive coinbase on when solo mining. Anything that isn't 40 hex chars
-is rejected at startup with a clear error.
-
-## Building
-
-CPU-only (no GPU toolchain needed):
+## Build from source
 
 ```sh
-cargo build --release
+cargo build --release                      # CPU
+cargo build --release --features cuda      # + NVIDIA
+cargo build --release --features opencl    # + AMD
 ```
 
-With a GPU backend:
+Do **not** build with `RUSTFLAGS=-C target-cpu=native` — it disables the
+hand-written SHA-NI path.
 
-```sh
-cargo build --release --features cuda          # NVIDIA
-cargo build --release --features opencl        # AMD / other
-cargo build --release --features "cuda,opencl" # both; auto-pick best at runtime
-```
+## License & provenance
 
-The pool endpoint is compiled into the binary. (Operators cutting a release: set
-it in `src/endpoint.rs` — see the module docs there.)
-
-## License
-
-MIT OR Apache-2.0.
+MIT OR Apache-2.0. cairn-miner is a clean fork of the Compute Substrate pool
+miner **at its v0.1.6 tag** (the last release under MIT/Apache); it reuses none
+of that project's later PolyForm-licensed code. "Compute Substrate" / "CSD" and
+related marks belong to their owners and are used only to state compatibility.
+See `NOTICE`.

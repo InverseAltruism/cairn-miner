@@ -173,6 +173,14 @@ enum Cmd {
         #[arg(long, default_value_t = 0xC0FFEE)]
         seed: u64,
     },
+
+    /// Micro-benchmark the CPU hashing paths (scalar vs N-way interleaved
+    /// SHA-NI batch) on this machine and print MH/s + speedup. No network.
+    Bench {
+        /// Nonces to hash per path.
+        #[arg(long, default_value_t = 20_000_000)]
+        nonces: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -356,6 +364,10 @@ fn main() -> Result<()> {
 
     if matches!(cli.cmd, Some(Cmd::Devices)) {
         return print_devices();
+    }
+
+    if let Some(Cmd::Bench { nonces }) = cli.cmd {
+        return cairn_miner::bench::run(cairn_miner::bench::BenchOpts { nonces });
     }
 
     if let Some(Cmd::Selftest {

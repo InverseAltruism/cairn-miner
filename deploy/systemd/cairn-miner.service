@@ -1,0 +1,28 @@
+# cairn-miner - single-instance systemd service (Linux rig).
+# Install:
+#   sudo cp cairn-miner /usr/local/bin/
+#   sudo cp deploy/systemd/cairn-miner.service /etc/systemd/system/
+#   sudo mkdir -p /etc/cairn-miner && sudoedit /etc/cairn-miner/config.toml   # address = "...", backend = "..."
+#   sudo systemctl enable --now cairn-miner
+[Unit]
+Description=cairn-miner (Compute Substrate pool miner)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cairn-miner --config /etc/cairn-miner/config.toml --log-dir /var/log/cairn-miner
+Restart=always
+RestartSec=5
+Nice=5
+# Hardening (miner needs no privileges, no write outside its log dir).
+DynamicUser=yes
+StateDirectory=cairn-miner
+LogsDirectory=cairn-miner
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

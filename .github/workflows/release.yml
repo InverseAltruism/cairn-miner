@@ -1,24 +1,24 @@
 name: release
 
-# Builds the Windows + Linux miner binaries and publishes them to a GitHub Release.
+# Builds the Windows + Linux miner binaries and the HiveOS package and publishes
+# them to a GitHub Release, with a SHA256SUMS manifest and a latest-version.txt
+# beacon that mine-auto.sh / mine-auto.bat / HiveOS use for fail-safe self-update.
 #
 # Triggers:
 #   * push a tag  v*   -> build all variants AND publish them to the release
 #   * workflow_dispatch -> build only (smoke-test that everything compiles)
 #
-# Assets produced (consumed by install-csd-miner.bat / install-csd-miner.sh):
-#   csd-pool-miner-cpu.exe    / csd-pool-miner-linux-cpu     (always; no GPU deps)
-#   csd-pool-miner-nvidia.exe / csd-pool-miner-linux-nvidia  (CUDA; best-effort)
-#   csd-pool-miner-amd.exe    / csd-pool-miner-linux-amd     (OpenCL; best-effort)
+# Assets produced (consumed by install.sh / install.ps1 / mine-auto.* / HiveOS):
+#   cairn-miner-linux-cpu-x86_64    / cairn-miner-windows-cpu.exe     (always)
+#   cairn-miner-linux-cuda-x86_64   / cairn-miner-windows-cuda.exe    (best-effort)
+#   cairn-miner-linux-opencl-x86_64 / cairn-miner-windows-opencl.exe  (best-effort)
+#   cairn-miner-hiveos.tar.gz       (HiveOS custom miner package)
+#   SHA256SUMS                      (checksums of every asset above)
+#   latest-version.txt              (the release version, for the update beacon)
 #
-# NOTE for the operator: before tagging a REAL release, set the pool endpoint in
-# src/endpoint.rs (it ships as a placeholder).
-#
-# FIRST-RUN ITERATION POINTS (these run on GitHub, not locally — watch the logs):
-#   * The CPU build is the safe one and should always succeed.
-#   * The NVIDIA/AMD builds are marked continue-on-error so a failure there does
-#     NOT block the CPU release. The AMD/OpenCL link step (vcpkg) is the most
-#     likely thing to need adjustment on the first run.
+# The Linux binaries are built with cargo-zigbuild against an OLD glibc floor so
+# they run on HiveOS (glibc 2.27+) as well as current distros. GPU builds are
+# continue-on-error so a GPU toolchain hiccup never blocks the CPU release.
 
 on:
   push:
@@ -33,92 +33,91 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal --no-self-update
-
-      - name: Prepare dist folder
+      - name: Prepare dist
         shell: pwsh
         run: New-Item -ItemType Directory -Force dist | Out-Null
-
       - name: Build CPU (always works, no GPU deps)
         shell: pwsh
         run: |
           cargo build --release
-          Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-cpu.exe
-
+          Copy-Item target/release/cairn-miner.exe dist/cairn-miner-windows-cpu.exe
       - name: Build NVIDIA (cuda)
         continue-on-error: true
         shell: pwsh
         run: |
           cargo build --release --features cuda
-          Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-nvidia.exe
-
+          Copy-Item target/release/cairn-miner.exe dist/cairn-miner-windows-cuda.exe
       - name: Install OpenCL via vcpkg (for the AMD build)
         continue-on-error: true
         shell: pwsh
         run: |
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencl:x64-windows
           "LIB=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Build AMD (opencl)
         continue-on-error: true
         shell: pwsh
         run: |
           cargo build --release --features opencl
-          Copy-Item target/release/csd-gpu-miner.exe dist/csd-pool-miner-amd.exe
-
-      - name: List built artifacts
-        shell: pwsh
-        run: Get-ChildItem dist
-
-      - name: Publish to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          fail_on_unmatched_files: false
+          Copy-Item target/release/cairn-miner.exe dist/cairn-miner-windows-opencl.exe
+      - name: Upload windows artifacts
+        uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/* }
 
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal --no-self-update
-
-      - name: Prepare dist folder
-        run: mkdir -p dist
-
-      - name: Build CPU (always works, no GPU deps)
+      - name: Install cargo-zigbuild (glibc floor for HiveOS)
         run: |
-          cargo build --release
-          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-cpu
-
-      # NVIDIA: the CUDA backend embeds a pre-built PTX and JITs it via the driver,
-      # so this build needs NO CUDA Toolkit on the runner (cudarc dlopens the driver
-      # at runtime; the PTX is committed). continue-on-error keeps CPU shipping.
+          pip install ziglang==0.13.0
+          cargo install cargo-zigbuild --version 0.19.8 --locked
+      - name: Prepare dist
+        run: mkdir -p dist
+      - name: Build CPU (glibc 2.27 floor; always works)
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.27
+          cp target/x86_64-unknown-linux-gnu/release/cairn-miner dist/cairn-miner-linux-cpu-x86_64
+      # CUDA embeds a prebuilt PTX and JITs via the driver at runtime, so the
+      # runner needs no CUDA Toolkit. continue-on-error keeps CPU shipping.
       - name: Build NVIDIA (cuda)
         continue-on-error: true
         run: |
-          cargo build --release --features cuda
-          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-nvidia
-
+          cargo zigbuild --release --features cuda --target x86_64-unknown-linux-gnu.2.27
+          cp target/x86_64-unknown-linux-gnu/release/cairn-miner dist/cairn-miner-linux-cuda-x86_64
       - name: Install OpenCL loader + headers (for the AMD build)
         continue-on-error: true
         run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
-
       - name: Build AMD (opencl)
         continue-on-error: true
         run: |
           cargo build --release --features opencl
-          cp target/release/csd-gpu-miner dist/csd-pool-miner-linux-amd
+          cp target/release/cairn-miner dist/cairn-miner-linux-opencl-x86_64
+      - name: Build HiveOS package (bundles the CPU seed)
+        run: bash packaging/build-hiveos-package.sh dist/cairn-miner-linux-cpu-x86_64 dist/cairn-miner-hiveos.tar.gz
+      - name: Upload linux artifacts
+        uses: actions/upload-artifact@v4
+        with: { name: linux, path: dist/* }
 
-      - name: List built artifacts
-        run: ls -la dist
-
-      - name: Publish to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/')
+  publish:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: staged }
+      - name: Collect assets + build manifests
+        run: |
+          mkdir -p dist && find staged -type f -exec cp {} dist/ \;
+          cd dist
+          # version beacon from the tag (v0.1.0 -> 0.1.0)
+          echo "${GITHUB_REF_NAME#v}" > latest-version.txt
+          sha256sum cairn-miner-* > SHA256SUMS
+          ls -la
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*

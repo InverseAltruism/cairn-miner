@@ -3,3 +3,4 @@
 *.current.log
 csd-wallet.txt
 config.toml
+dist/

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use crate::backend::{MiningBackend, MiningResult};
-use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
+use crate::sha256d_cpu::{BatchHasher, BATCH_LANES};
 
 pub struct CpuBackend {
     pub threads: usize,
@@ -54,12 +54,13 @@ impl MiningBackend for CpuBackend {
         if nonce_end <= nonce_start {
             return None;
         }
-        let midstate = midstate_of_first_chunk_fast(&header_84);
-
-        // The 16 fixed bytes of the tail (merkle_tail|time|bits) come from the
-        // header and don't change inside the loop; nonce is appended per attempt.
-        let mut tail_template = [0u8; 20];
-        tail_template[..16].copy_from_slice(&header_84[64..80]);
+        // One hasher precomputes the first-block midstate; it is `Copy`, so each
+        // worker thread gets its own by value. On a SHA-NI CPU its `hash_batch`
+        // interleaves BATCH_LANES independent nonces to keep the SHA unit busy;
+        // on other CPUs it falls back to the portable per-nonce path. Either
+        // way the output is byte-identical to the scalar reference (pinned by
+        // `batch_matches_reference` and end-to-end by `selftest`).
+        let hasher = BatchHasher::new(&header_84);
 
         let next_nonce = AtomicU32::new(nonce_start);
         let found = std::sync::Arc::new(std::sync::Mutex::new(None::<MiningResult>));
@@ -67,38 +68,55 @@ impl MiningBackend for CpuBackend {
 
         thread::scope(|scope| {
             for _ in 0..self.threads {
-                let midstate = midstate;
-                let tail_template = tail_template;
+                let hasher = hasher;
                 let target = target;
                 let next_nonce = &next_nonce;
                 let found = found.clone();
                 let local_stop = &local_stop;
 
                 scope.spawn(move || {
-                    let mut tail = tail_template;
+                    let record = |n: u32, h: [u8; 32]| {
+                        let mut g = found.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(MiningResult { nonce: n, hash: h });
+                        }
+                        local_stop.store(true, Ordering::Relaxed);
+                    };
                     loop {
                         if stop.load(Ordering::Relaxed) || local_stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        // Grab a small chunk of nonces so threads don't
-                        // hammer the atomic.
+                        // Grab a chunk of nonces so threads don't hammer the
+                        // atomic. A multiple of BATCH_LANES so the batch loop
+                        // divides evenly except at the final clamp.
                         const CHUNK: u32 = 4096;
                         let start = next_nonce.fetch_add(CHUNK, Ordering::Relaxed);
                         if start >= nonce_end {
                             return;
                         }
                         let end = start.saturating_add(CHUNK).min(nonce_end);
-                        for n in start..end {
-                            tail[16..20].copy_from_slice(&n.to_le_bytes());
-                            let h = finish_sha256d_from_midstate_fast(&midstate, &tail);
-                            if hash_leq_target(&h, &target) {
-                                let mut g = found.lock().unwrap();
-                                if g.is_none() {
-                                    *g = Some(MiningResult { nonce: n, hash: h });
+                        let lanes = BATCH_LANES as u32;
+                        let mut n = start;
+                        // Full interleaved batches.
+                        while n + lanes <= end {
+                            let mut out = [[0u8; 32]; BATCH_LANES];
+                            hasher.hash_batch::<BATCH_LANES>(n, &mut out);
+                            for (i, h) in out.iter().enumerate() {
+                                if hash_leq_target(h, &target) {
+                                    record(n + i as u32, *h);
+                                    return;
                                 }
-                                local_stop.store(true, Ordering::Relaxed);
+                            }
+                            n += lanes;
+                        }
+                        // Remainder (only at the clamped tail of the range).
+                        while n < end {
+                            let h = hasher.hash_one(n);
+                            if hash_leq_target(&h, &target) {
+                                record(n, h);
                                 return;
                             }
+                            n += 1;
                         }
                     }
                 });
