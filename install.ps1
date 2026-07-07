@@ -16,7 +16,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $Repo = "InverseAltruism/cairn-miner"
-$DefaultPool = "pool.cairn-substrate.com:3333"
+$DefaultPool = "cairn-pool.com:3333"
 
 function Grn($m){ Write-Host $m -ForegroundColor Green }
 function Die($m){ Write-Host "[x] $m" -ForegroundColor Red; exit 1 }

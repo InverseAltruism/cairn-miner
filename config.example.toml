@@ -17,8 +17,8 @@
 # Pool endpoint(s). Defaults to the public cairn pool if unset. A single string
 # points at one pool; a list adds failover backups (the miner starts on the
 # first that answers and walks down the list if a pool stays unreachable):
-#pool = "pool.cairn-substrate.com:3333"
-#pool = ["pool.cairn-substrate.com:3333", "backup.example.org:3333"]
+#pool = "cairn-pool.com:3333"
+#pool = ["cairn-pool.com:3333", "backup.example.org:3333"]
 
 # Worker/rig name. The pool authorizes as <address>.<worker> so each rig's stats
 # show separately on the dashboard; payouts still go to the bare address.

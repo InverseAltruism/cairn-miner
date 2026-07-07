@@ -16,7 +16,7 @@ set -euo pipefail
 #
 #  Options (env or flags):
 #     CAIRN_ADDR=<addr20>      your 40-hex payout address (required, no TTY prompt under curl|bash)
-#     CAIRN_POOL=host:3333     override the pool endpoint (default: pool.cairn-substrate.com:3333)
+#     CAIRN_POOL=host:3333     override the pool endpoint (default: cairn-pool.com:3333)
 #     CAIRN_WORKER=<name>      rig name (default: hostname)
 #     CAIRN_BACKEND=auto|cpu|cuda|opencl   force a backend (default: auto-detect)
 #     --service                install + enable a systemd user/system service instead of running inline
@@ -27,7 +27,7 @@ set -euo pipefail
 # ============================================================================
 
 REPO="InverseAltruism/cairn-miner"
-DEFAULT_POOL="pool.cairn-substrate.com:3333"
+DEFAULT_POOL="cairn-pool.com:3333"
 
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/cairn-miner"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cairn-miner"

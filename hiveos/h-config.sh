@@ -17,7 +17,7 @@ worker="${WORKER_NAME:-$(hostname)}"
 addr="${addr#0x}"
 
 # Pool: default to the public cairn pool; strip any stratum+tcp:// prefix.
-pool="${CUSTOM_URL:-pool.cairn-substrate.com:3333}"
+pool="${CUSTOM_URL:-cairn-pool.com:3333}"
 pool="${pool#stratum+tcp://}"; pool="${pool#stratum://}"
 
 {

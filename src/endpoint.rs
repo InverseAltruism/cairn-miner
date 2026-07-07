@@ -6,7 +6,7 @@
 
 /// Default Stratum v1 endpoint (`host:port`) used when no `--pool` flag and no
 /// `pool =` config value is given: the public cairn pool.
-pub const DEFAULT_POOL: &str = "pool.cairn-substrate.com:3333";
+pub const DEFAULT_POOL: &str = "cairn-pool.com:3333";
 
 /// Return the default pool endpoint as an owned string.
 pub fn pool_endpoint() -> String {

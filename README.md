@@ -2,7 +2,7 @@
 
 An open GPU/CPU miner for the **Compute Substrate (CSD)** chain, over Stratum v1.
 
-It mines to the [cairn pool](https://pool.cairn-substrate.com) by default, but
+It mines to the [cairn pool](https://cairn-pool.com) by default, but
 the pool is **not** compiled in: `--pool` points it anywhere, and you can list
 several for failover. Your address is your account; there is no signup, no
 phone-home, and **no bundled relay** that follows a remote blacklist.
@@ -41,7 +41,7 @@ Flight sheet → Miner: **Custom** →
 - Miner name in config: `cairn-miner`
 - Hash algorithm: `sha256d`
 - Wallet and worker template: `%WAL%`  (your addr20)
-- Pool URL: `pool.cairn-substrate.com:3333`  (or leave blank for the default)
+- Pool URL: `cairn-pool.com:3333`  (or leave blank for the default)
 - Pass: `x`
 
 That's it — standard fields, no dummy pool URL, no exact-name gotchas. Multi-GPU
@@ -66,7 +66,7 @@ Windows) — see `config.example.toml`:
 
 ```toml
 address = "your40charaddr20..."
-pool = ["pool.cairn-substrate.com:3333", "backup.example:3333"]
+pool = ["cairn-pool.com:3333", "backup.example:3333"]
 worker = "rig-01"
 backend = "auto"     # auto | cpu | cuda | opencl
 cpu_threads = 0      # GPU-only by default; raise on a desktop with headroom
