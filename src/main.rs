@@ -115,6 +115,12 @@ struct Cli {
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
 
+    /// Serve live telemetry as JSON on `http://127.0.0.1:<PORT>/stats`
+    /// (loopback only). The native launcher sets this so it can display
+    /// hashrate, shares and connection state. Omit or set 0 to disable.
+    #[arg(long)]
+    stats_port: Option<u16>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -342,7 +348,36 @@ fn merge_config(cli: &mut Cli, matches: &clap::ArgMatches, file: config_file::Fi
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        // Print the full error chain (anyhow's `{:?}` includes the causes).
+        eprintln!("\nError: {e:?}");
+        // A double-clicked console .exe on Windows closes its window the instant
+        // the process exits, so the message above would flash and vanish — the
+        // #1 "it just instantly stops" report. If we own an interactive console
+        // (i.e. double-clicked, not piped from a script/service), hold it open
+        // until the user has read the error.
+        #[cfg(windows)]
+        {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                eprintln!("\n────────────────────────────────────────────────────────");
+                eprintln!("cairn-miner could not start (see the error above).");
+                eprintln!("The most common cause: no payout address was given.");
+                eprintln!("Run it from a terminal with your address, e.g.:");
+                eprintln!("    cairn-miner.exe --address <your-addr20>");
+                eprintln!("...or use the cairn-miner launcher, which sets this for you.");
+                eprintln!("────────────────────────────────────────────────────────");
+                eprintln!("Press Enter to close this window...");
+                let mut _s = String::new();
+                let _ = std::io::stdin().read_line(&mut _s);
+            }
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("{e}"))?;
     let _log_guard = logging::init("cairn-miner", &cli.log_dir)?;
@@ -423,11 +458,16 @@ fn main() -> Result<()> {
         None => address.clone(),
     };
 
+    // Shared live telemetry: the Stratum client (connection/shares/difficulty)
+    // and the mining loop (hashrate) both update this one instance, and the
+    // optional loopback stats server reads it for the launcher.
+    let stats = Arc::new(cairn_miner::stats::MinerStats::new());
+
     let mut client = None;
     let mut last_err = None;
     for endpoint in &pools {
         tracing::info!("cairn-miner: connecting to pool {endpoint} as {auth_username}");
-        match StratumClient::connect(endpoint, &auth_username) {
+        match StratumClient::connect_with_stats(endpoint, &auth_username, stats.clone()) {
             Ok(c) => {
                 client = Some(c);
                 break;
@@ -442,6 +482,15 @@ fn main() -> Result<()> {
         Some(c) => c,
         None => return Err(last_err.expect("at least one pool endpoint attempted")),
     };
+
+    // Publish descriptive metadata and, if requested, start the loopback stats
+    // server the launcher polls. A port of 0 (or the flag omitted) disables it.
+    stats.set_meta(client.endpoint(), worker.as_deref().unwrap_or(""));
+    if let Some(port) = cli.stats_port {
+        if port != 0 {
+            cairn_miner::stats_server::spawn(stats.clone(), port);
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     {

@@ -12,6 +12,9 @@ name: release
 #   cairn-miner-linux-cpu-x86_64    / cairn-miner-windows-cpu.exe     (always)
 #   cairn-miner-linux-cuda-x86_64   / cairn-miner-windows-cuda.exe    (best-effort)
 #   cairn-miner-linux-opencl-x86_64 / cairn-miner-windows-opencl.exe  (best-effort)
+#   cairn-miner-launcher.exe        (native Windows GUI launcher)
+#   cairn-miner-launcher-windows.zip(launcher + all-backends cairn-miner.exe;
+#                                     the recommended one-download for Windows users)
 #   cairn-miner-hiveos.tar.gz       (HiveOS custom miner package)
 #   SHA256SUMS                      (checksums of every asset above)
 #   latest-version.txt              (the release version, for the update beacon)
@@ -61,6 +64,39 @@ jobs:
         run: |
           cargo build --release --features opencl
           Copy-Item target/release/cairn-miner.exe dist/cairn-miner-windows-opencl.exe
+      # The native GUI launcher (icon embedded via build.rs). Standalone asset +
+      # bundled with a miner below. `-p` builds only the launcher member; thin
+      # LTO keeps the eframe build fast and off the OOM edge. Best-effort so an
+      # unforeseen GUI-toolkit hiccup can never block the miner release.
+      - name: Build launcher (native GUI)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo build --release -p cairn-miner-launcher --config profile.release.lto=`"thin`"
+          Copy-Item target/release/cairn-miner-launcher.exe dist/cairn-miner-launcher.exe
+      # An all-backends miner (cuda+opencl+cpu, --backend auto picks the best) to
+      # ship *inside* the launcher zip as `cairn-miner.exe`, so the launcher finds
+      # it right beside itself. Needs the OpenCL LIB set by the vcpkg step above.
+      - name: Build all-backends miner for the bundle (best-effort)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          cargo build --release --features "cuda,opencl"
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          Copy-Item target/release/cairn-miner.exe bundle/cairn-miner.exe
+      - name: Package launcher bundle zip (only if the launcher built)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/cairn-miner-launcher.exe)) {
+            Write-Host "launcher.exe missing (build failed); skipping bundle"
+            exit 0
+          }
+          New-Item -ItemType Directory -Force bundle | Out-Null
+          if (-not (Test-Path bundle/cairn-miner.exe)) {
+            Copy-Item dist/cairn-miner-windows-cpu.exe bundle/cairn-miner.exe
+          }
+          Copy-Item dist/cairn-miner-launcher.exe bundle/cairn-miner-launcher.exe
+          Compress-Archive -Path bundle/* -DestinationPath dist/cairn-miner-launcher-windows.zip -Force
       - name: Upload windows artifacts
         uses: actions/upload-artifact@v4
         with: { name: windows, path: dist/* }

@@ -140,15 +140,38 @@ pub fn run_stratum<B: MiningBackend>(
     let mut gpu_nonces_since_log: u128 = 0;
     let mut cpu_nonces_since_log: u128 = 0;
 
+    // Live telemetry for the launcher / stats server. Hashrate is republished on
+    // a tighter cadence than the 10s human-readable log so the UI graph is
+    // responsive; the backend label is set once up front.
+    let stats = client.stats();
+    stats.set_backend(backend.name());
+    let mut last_hps_pub = Instant::now();
+    let mut gpu_nonces_since_pub: u128 = 0;
+    let mut cpu_nonces_since_pub: u128 = 0;
+
     // Rate-limit the "waiting for first job" notice so a slow pool start
     // doesn't spam the log.
     let mut last_wait_log = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
-    // The miner-rolled high half of the coinbase extranonce. Bumped once per
-    // exhausted launch. The low half (xn1) is pool-fixed and NEVER rolled here.
+    // The miner-rolled high half of the coinbase extranonce. Rolled once the
+    // whole 32-bit nonce space for the current xn2 is exhausted. The low half
+    // (xn1) is pool-fixed and NEVER rolled here.
     let mut xn2: u32 = 0;
+
+    // We sweep the nonce space in bounded CHUNKS rather than the whole 4.29B
+    // range per launch: a full-range launch on a CPU backend takes minutes,
+    // during which new pool jobs (mining.notify) can't be picked up — so the
+    // miner would grind stale work and its live hashrate would only refresh
+    // per-launch. Chunking bounds each launch to ~TARGET so job/stop checks and
+    // hashrate publishes run frequently on every backend. `chunk_size` adapts
+    // toward the target wall-time (small on CPU, large on a fast GPU).
+    const CHUNK_TARGET_MS: f64 = 400.0;
+    const CHUNK_MIN: u32 = 1 << 20; // ~1.0M nonces
+    const CHUNK_MAX: u32 = 1 << 30; // ~1.07B nonces
+    let mut chunk_size: u32 = 1 << 24; // ~16.8M to start; adapts after each chunk
+    let mut nonce_cursor: u32 = 0; // next nonce to sweep for the current job/xn2
 
     if cfg.cpu_threads > 0 && cfg.cpu_share > 0.0 {
         tracing::info!(
@@ -217,9 +240,13 @@ pub fn run_stratum<B: MiningBackend>(
         );
 
         let last_refresh = Instant::now();
+        // A fresh job means a new header; restart the nonce sweep from 0 (the
+        // current xn2 carries over — it's just more coinbase variety).
+        nonce_cursor = 0;
 
-        // Inner per-launch loop for THIS job. Re-derives the coinbase/header
-        // each launch from the rolled xn2, races the backends, submits on find.
+        // Inner per-launch loop for THIS job. Each iteration sweeps one bounded
+        // nonce chunk (see `chunk_size`), re-derives the coinbase/header from the
+        // current xn2, races the backends, and submits on find.
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
@@ -255,11 +282,18 @@ pub fn run_stratum<B: MiningBackend>(
                 0,
             );
 
-            // Partition the nonce range between GPU + CPU pool (same helper the
-            // node loop uses).
+            // This launch sweeps only [chunk_start, chunk_end) of the nonce
+            // space (a bounded slice of [nonce_start, nonce_end)), then the loop
+            // re-checks for new jobs and publishes hashrate before continuing.
+            let chunk_start = nonce_cursor.max(template.nonce_start);
+            let chunk_end = chunk_start.saturating_add(chunk_size).min(template.nonce_end);
+            let chunk_t0 = Instant::now();
+
+            // Partition this chunk between GPU + CPU pool (same helper the node
+            // loop uses).
             let (gpu_range, cpu_ranges) = partition_nonce_range(
-                template.nonce_start,
-                template.nonce_end,
+                chunk_start,
+                chunk_end,
                 cfg.cpu_share,
                 cfg.cpu_threads,
             );
@@ -361,6 +395,20 @@ pub fn run_stratum<B: MiningBackend>(
             gpu_nonces_since_log = gpu_nonces_since_log.saturating_add(gpu_swept);
             cpu_nonces_since_log = cpu_nonces_since_log.saturating_add(cpu_swept_n);
 
+            // Publish live hash rate (hashes/sec) to the shared stats ~every 2s.
+            gpu_nonces_since_pub = gpu_nonces_since_pub.saturating_add(gpu_swept);
+            cpu_nonces_since_pub = cpu_nonces_since_pub.saturating_add(cpu_swept_n);
+            if last_hps_pub.elapsed() >= Duration::from_secs(2) {
+                let el = last_hps_pub.elapsed().as_secs_f64().max(1e-6);
+                stats.set_hps(
+                    gpu_nonces_since_pub as f64 / el,
+                    cpu_nonces_since_pub as f64 / el,
+                );
+                gpu_nonces_since_pub = 0;
+                cpu_nonces_since_pub = 0;
+                last_hps_pub = Instant::now();
+            }
+
             enum WinSource {
                 Gpu(MiningResult),
                 Cpu(CpuFind),
@@ -370,6 +418,9 @@ pub fn run_stratum<B: MiningBackend>(
                 (None, Some(c)) => Some(WinSource::Cpu(c)),
                 (None, None) => None,
             };
+            // A find early-exits the backend mid-chunk, so this chunk's wall
+            // time isn't representative — used below to gate chunk-size tuning.
+            let found = win.is_some();
 
             match win {
                 Some(src) => {
@@ -441,13 +492,12 @@ pub fn run_stratum<B: MiningBackend>(
                         ),
                     }
 
-                    // Roll xn2 for the next launch and re-derive work (next job
-                    // poll happens at the top of the inner loop).
-                    xn2 = xn2.wrapping_add(1);
+                    // Keep scanning this coinbase's remaining nonce space for
+                    // more shares — the cursor advances in the common block below.
                 }
                 None => {
-                    // Exhausted this launch's nonce range with no share. Roll
-                    // xn2 and try the next slice of coinbase space.
+                    // Swept this chunk with no share; fall through to advance the
+                    // cursor onto the next slice.
                     if last_hashrate_log.elapsed() >= Duration::from_secs(10) {
                         let elapsed = last_hashrate_log.elapsed().as_secs_f64();
                         let ghs_gpu = (gpu_nonces_since_log as f64) / 1e9 / elapsed;
@@ -461,8 +511,27 @@ pub fn run_stratum<B: MiningBackend>(
                         gpu_nonces_since_log = 0;
                         cpu_nonces_since_log = 0;
                     }
-                    xn2 = xn2.wrapping_add(1);
                 }
+            }
+
+            // Advance the nonce cursor onto the next chunk; roll xn2 (a fresh
+            // coinbase) once this xn2's whole nonce space is swept. Tune the
+            // chunk size toward CHUNK_TARGET_MS so each launch stays short on
+            // every backend — but only after a full sweep, since a find
+            // early-exits the backend and would skew the measured rate.
+            if !found {
+                let ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
+                if ms > 1.0 {
+                    let scaled = (chunk_size as f64 * (CHUNK_TARGET_MS / ms))
+                        .clamp(CHUNK_MIN as f64, CHUNK_MAX as f64);
+                    chunk_size = scaled as u32;
+                }
+            }
+            if chunk_end >= template.nonce_end {
+                xn2 = xn2.wrapping_add(1);
+                nonce_cursor = template.nonce_start;
+            } else {
+                nonce_cursor = chunk_end;
             }
         }
     }

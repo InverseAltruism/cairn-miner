@@ -26,10 +26,24 @@ no prebuilt release fits your arch), saves your address, and starts mining. Add
 `--service` to install a systemd/user service, or run `mine-auto.sh` for a
 self-updating launcher.
 
-### Windows (one click)
+### Windows — the launcher (recommended)
 
-Download **`install.bat`** from the
-[latest release](https://github.com/InverseAltruism/cairn-miner/releases/latest)
+Download **`cairn-miner-launcher-windows.zip`** from the
+[latest release](https://github.com/InverseAltruism/cairn-miner/releases/latest),
+extract it anywhere, and run **`cairn-miner-launcher.exe`**. The native app lets
+you set your address, pick a backend, **Start/Stop** mining, toggle
+**start-on-login**, and watch live performance — hashrate graph, accepted/rejected
+shares, difficulty, uptime. The miner runs headless behind it (all backends
+bundled; `auto` picks CUDA → OpenCL → CPU).
+
+> Double-clicking a bare `cairn-miner.exe` with no settings just exits — it needs
+> your payout address. The launcher is the friendly way in; if you do run the
+> miner from a terminal, pass `--address <your-addr20>`.
+
+### Windows (scripted install)
+
+Prefer a headless install/service instead of the GUI? Download **`install.bat`**
+from the [latest release](https://github.com/InverseAltruism/cairn-miner/releases/latest)
 and double-click it. It detects your GPU, downloads the right `cairn-miner.exe`,
 asks for your address once, and starts mining. `install.bat` (via `install.ps1`)
 also accepts `-Service` to run at logon.

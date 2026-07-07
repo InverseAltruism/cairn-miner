@@ -31,6 +31,7 @@ use super::protocol::{
     authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
     Notification, Response, SubscribeResult,
 };
+use crate::stats::MinerStats;
 
 /// How long to wait on `connect()` for the TCP three-way handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -51,6 +52,16 @@ pub struct StratumJob {
     pub extranonce1_hex: String,
 }
 
+/// A response to one of our `mining.submit` requests: `{id, result, error}`.
+/// The pool acks each submitted share with `result:true` (accepted) or
+/// `false`/an error (rejected/stale). Submit ids are >= 100 (see `next_id`),
+/// which distinguishes them from the id=1/2 handshake replies.
+#[derive(serde::Deserialize)]
+struct SubmitAck {
+    id: Option<u64>,
+    result: Option<bool>,
+}
+
 /// Shared state the reader thread writes and the mining thread reads.
 struct Shared {
     /// Latest pushed job, if any has arrived yet.
@@ -67,11 +78,16 @@ struct Shared {
     extranonce2_size: AtomicU64,
     /// Set on shutdown so the reader loop exits instead of reconnecting.
     shutdown: AtomicBool,
+    /// Live telemetry shared with the mining loop and the loopback stats server.
+    /// The reader thread updates connection state, difficulty and accepted/
+    /// rejected share counts here as frames arrive.
+    stats: Arc<MinerStats>,
 }
 
 impl Shared {
     fn set_difficulty(&self, d: f64) {
         self.difficulty_bits.store(d.to_bits(), Ordering::Relaxed);
+        self.stats.set_difficulty(d);
     }
     fn difficulty(&self) -> f64 {
         f64::from_bits(self.difficulty_bits.load(Ordering::Relaxed))
@@ -118,6 +134,17 @@ impl StratumClient {
     /// handshake, capture `extranonce1`/`extranonce2_size`, confirm authorize
     /// returned `true` (bail otherwise), then spawn the reader thread.
     pub fn connect(endpoint: &str, worker_addr: &str) -> Result<Self> {
+        Self::connect_with_stats(endpoint, worker_addr, Arc::new(MinerStats::new()))
+    }
+
+    /// Like [`connect`](Self::connect) but shares an existing [`MinerStats`] so
+    /// the mining loop and the loopback stats server observe the same live
+    /// counters this client updates.
+    pub fn connect_with_stats(
+        endpoint: &str,
+        worker_addr: &str,
+        stats: Arc<MinerStats>,
+    ) -> Result<Self> {
         let hs = Self::handshake(endpoint, worker_addr)
             .with_context(|| format!("stratum handshake to {endpoint}"))?;
 
@@ -127,7 +154,10 @@ impl StratumClient {
             extranonce1_hex: Mutex::new(hs.subscribe.extranonce1_hex.clone()),
             extranonce2_size: AtomicU64::new(hs.subscribe.extranonce2_size as u64),
             shutdown: AtomicBool::new(false),
+            stats,
         });
+        // Handshake succeeded, so we're live from the caller's point of view.
+        shared.stats.set_connected(true);
 
         let extranonce1 = hs.subscribe.extranonce1_hex.clone();
         let xn2_size = hs.subscribe.extranonce2_size;
@@ -371,6 +401,12 @@ impl StratumClient {
         self.shared.difficulty()
     }
 
+    /// Handle to the shared live telemetry this client updates. The mining loop
+    /// clones it to publish hashrate; the stats server reads it.
+    pub fn stats(&self) -> Arc<MinerStats> {
+        Arc::clone(&self.shared.stats)
+    }
+
     /// Session extranonce1 (hex), refreshed on reconnect.
     pub fn extranonce1_hex(&self) -> String {
         self.shared
@@ -415,6 +451,9 @@ impl StratumClient {
         w.write_all(line.as_bytes())
             .context("writing mining.submit")?;
         w.flush().ok();
+        // Count the share as submitted; the pool's async accept/reject ack is
+        // tallied later by the reader thread in `dispatch_frame`.
+        self.shared.stats.on_share_submitted();
         Ok(())
     }
 }
@@ -446,9 +485,20 @@ fn dispatch_frame(line: &str, shared: &Shared) {
     }
     let note: Notification = match serde_json::from_str(line) {
         Ok(n) => n,
-        // Not a notification (e.g. a submit response with an `id`, or junk):
-        // nothing for the reader to track here.
-        Err(_) => return,
+        // Not a notification. It may be the pool's ack to one of our
+        // `mining.submit`s (`{id,result,error}`, id >= 100) — tally accepted vs
+        // rejected shares from it. Anything else (junk, keep-alives) is ignored.
+        Err(_) => {
+            if let Ok(ack) = serde_json::from_str::<SubmitAck>(line) {
+                if ack.id.map(|id| id >= 100).unwrap_or(false) {
+                    match ack.result {
+                        Some(true) => shared.stats.on_share_accepted(),
+                        _ => shared.stats.on_share_rejected(),
+                    }
+                }
+            }
+            return;
+        }
     };
 
     match note.method.as_str() {
@@ -509,6 +559,8 @@ fn reconnect(
     reader: &mut BufReader<TcpStream>,
     backoff: &mut Duration,
 ) -> bool {
+    // We're between sockets until the handshake below succeeds.
+    shared.stats.set_connected(false);
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
             return false;
@@ -547,6 +599,7 @@ fn reconnect(
                     *w = hs.write_stream;
                 }
                 *backoff = BACKOFF_MIN;
+                shared.stats.set_connected(true);
                 tracing::info!("stratum: reconnected to {endpoint}");
                 return true;
             }
@@ -573,6 +626,7 @@ mod tests {
             extranonce1_hex: Mutex::new(xn1.to_string()),
             extranonce2_size: AtomicU64::new(xn2_size),
             shutdown: AtomicBool::new(false),
+            stats: Arc::new(MinerStats::new()),
         })
     }
 

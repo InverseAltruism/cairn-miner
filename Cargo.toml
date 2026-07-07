@@ -1,7 +1,7 @@
 [package]
 name        = "cairn-miner"
 repository  = "https://github.com/InverseAltruism/cairn-miner"
-version     = "0.1.0"
+version     = "0.1.1"
 edition     = "2021"
 rust-version = "1.75"
 license     = "MIT OR Apache-2.0"
@@ -58,6 +58,15 @@ ctrlc       = "3"
 cudarc      = { version = "0.19", features = ["cuda-13020", "driver", "nvrtc"], optional = true }
 opencl3     = { version = "0.9", optional = true }
 
+# Icon: generate a .ico from the logo PNG (all hosts) and embed it in the
+# console exe on Windows so Explorer/taskbar show the cairn logo.
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+ico   = "0.5"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level     = 3
 lto           = "fat"
@@ -67,3 +76,11 @@ strip         = true
 # unwind (not abort) so the miner can catch panics from cudarc when an
 # incompatible CUDA toolkit is installed, and fall back to OpenCL cleanly.
 panic         = "unwind"
+
+# The GUI launcher is a separate workspace member so its egui/eframe dependency
+# graph never enters the lean miner build. `default-members` keeps bare
+# `cargo build`/`cargo test` scoped to the miner; CI builds the launcher
+# explicitly with `-p cairn-miner-launcher`.
+[workspace]
+members        = ["launcher"]
+default-members = ["."]
