@@ -755,43 +755,63 @@ fn print_devices_json() -> Result<()> {
     struct DeviceList {
         gpus: Vec<GpuInfo>,
         cpu: CpuInfo,
+        /// Human-readable reasons a backend found nothing (driver error, not
+        /// compiled in, …) so the launcher can explain "no GPUs" instead of
+        /// failing silently.
+        notes: Vec<String>,
     }
 
     // `mut` is only needed when a GPU backend is compiled in.
     #[allow(unused_mut)]
     let mut gpus: Vec<GpuInfo> = Vec::new();
+    #[allow(unused_mut)]
+    let mut notes: Vec<String> = Vec::new();
 
     #[cfg(feature = "cuda")]
     {
-        if let Ok(n) = cudarc::driver::CudaContext::device_count() {
-            for i in 0..n as usize {
-                if let Ok(ctx) = cudarc::driver::CudaContext::new(i) {
-                    let name = ctx.name().unwrap_or_else(|_| "NVIDIA GPU".into());
-                    gpus.push(GpuInfo { backend: "cuda", index: i, name });
+        match cudarc::driver::CudaContext::device_count() {
+            Ok(n) if n > 0 => {
+                for i in 0..n as usize {
+                    match cudarc::driver::CudaContext::new(i) {
+                        Ok(ctx) => {
+                            let name = ctx.name().unwrap_or_else(|_| "NVIDIA GPU".into());
+                            gpus.push(GpuInfo { backend: "cuda", index: i, name });
+                        }
+                        Err(e) => notes.push(format!("cuda device {i}: {e}")),
+                    }
                 }
             }
+            Ok(_) => notes.push("cuda: driver reachable but no devices".into()),
+            Err(e) => notes.push(format!("cuda: {e}")),
         }
     }
+    #[cfg(not(feature = "cuda"))]
+    notes.push("cuda: not compiled into this build".into());
 
     #[cfg(feature = "opencl")]
     {
         use opencl3::device::{get_all_devices, Device, CL_DEVICE_TYPE_GPU};
         // Same enumeration the OpenCL backend uses, so the reported index is the
         // one `--device` expects.
-        if let Ok(devs) = get_all_devices(CL_DEVICE_TYPE_GPU) {
-            for (i, d) in devs.iter().enumerate() {
-                let dev = Device::new(*d);
-                let vendor = dev.vendor().unwrap_or_default();
-                // Skip NVIDIA cards here only if CUDA is compiled in (then they
-                // already appear above); otherwise list them via OpenCL.
-                if cfg!(feature = "cuda") && vendor.to_uppercase().contains("NVIDIA") {
-                    continue;
+        match get_all_devices(CL_DEVICE_TYPE_GPU) {
+            Ok(devs) => {
+                for (i, d) in devs.iter().enumerate() {
+                    let dev = Device::new(*d);
+                    let vendor = dev.vendor().unwrap_or_default();
+                    // Skip NVIDIA cards here only if CUDA is compiled in (then
+                    // they already appear above); otherwise list them via OpenCL.
+                    if cfg!(feature = "cuda") && vendor.to_uppercase().contains("NVIDIA") {
+                        continue;
+                    }
+                    let name = dev.name().unwrap_or_default();
+                    gpus.push(GpuInfo { backend: "opencl", index: i, name });
                 }
-                let name = dev.name().unwrap_or_default();
-                gpus.push(GpuInfo { backend: "opencl", index: i, name });
             }
+            Err(e) => notes.push(format!("opencl: {e:?}")),
         }
     }
+    #[cfg(not(feature = "opencl"))]
+    notes.push("opencl: not compiled into this build".into());
 
     let logical_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -799,6 +819,7 @@ fn print_devices_json() -> Result<()> {
     let list = DeviceList {
         gpus,
         cpu: CpuInfo { logical_cores },
+        notes,
     };
     println!("{}", serde_json::to_string(&list)?);
     Ok(())

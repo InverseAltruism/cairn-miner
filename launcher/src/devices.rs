@@ -33,16 +33,21 @@ pub struct Cpu {
 pub struct Devices {
     pub gpus: Vec<Gpu>,
     pub cpu: Cpu,
+    /// Diagnostic reasons a backend found nothing (shown when no GPUs appear).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// Run `<miner> devices --json` and parse it. On any failure returns a
 /// CPU-only view (no GPUs) so the launcher still works.
 pub fn probe(miner: &Path, log_dir: &Path) -> Devices {
     let mut cmd = Command::new(miner);
-    cmd.arg("devices")
-        .arg("--json")
-        .arg("--log-dir")
-        .arg(log_dir);
+    // `--log-dir` is a top-level flag, so it MUST come before the `devices`
+    // subcommand — clap rejects a top-level flag placed after a subcommand.
+    cmd.arg("--log-dir")
+        .arg(log_dir)
+        .arg("devices")
+        .arg("--json");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

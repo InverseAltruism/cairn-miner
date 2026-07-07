@@ -1,10 +1,10 @@
 //! cairn-miner-launcher — native desktop control panel for cairn-miner.
 //!
-//! A single, self-contained Windows app (the miner is embedded): pick a mining
-//! mode, tick the GPUs to use, set CPU intensity, Start/Stop, toggle
-//! start-on-login, and watch aggregated live performance across every worker —
-//! all in the cairn CRT-phosphor theme. One process is spawned per selected GPU
-//! (plus an optional CPU worker) and their stats are summed into one dashboard.
+//! A single, self-contained Windows app (the miner is embedded). Tabbed layout:
+//! a persistent top bar (brand + Start/Stop + status), then Dashboard (live
+//! aggregated performance across every worker), Settings (mode / GPU picker /
+//! CPU intensity / identity), and Logs (level-filtered). One process is spawned
+//! per selected GPU plus an optional CPU worker; their stats are summed.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -33,8 +33,8 @@ const POLL_EVERY: Duration = Duration::from_millis(1000);
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 840.0])
-            .with_min_inner_size([600.0, 600.0])
+            .with_inner_size([840.0, 720.0])
+            .with_min_inner_size([620.0, 560.0])
             .with_title("cairn // miner"),
         ..Default::default()
     };
@@ -46,6 +46,27 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(LauncherApp::new()))
         }),
     )
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Dashboard,
+    Settings,
+    Logs,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum LogFilter {
+    All,
+    Warn,
+    Error,
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Level {
+    Info,
+    Warn,
+    Error,
 }
 
 enum Action {
@@ -70,6 +91,8 @@ struct LauncherApp {
     hashrate_history: VecDeque<f32>,
     log_lines: Vec<String>,
 
+    tab: Tab,
+    log_filter: LogFilter,
     pools_text: String,
     autostart: bool,
     status: String,
@@ -105,13 +128,19 @@ impl LauncherApp {
             rows: Vec::new(),
             hashrate_history: VecDeque::with_capacity(HISTORY_LEN),
             log_lines: Vec::new(),
+            tab: Tab::Dashboard,
+            log_filter: LogFilter::All,
             pools_text,
             autostart: autostart::is_enabled(),
-            status: "idle — configure and press Start".into(),
+            status: "idle — set up in Settings, then Start".into(),
             last_poll: Instant::now() - POLL_EVERY,
             pending: None,
         };
         app.preselect_gpus_if_empty();
+        // Nudge first-run users with no address straight to Settings.
+        if app.cfg.address.trim().is_empty() {
+            app.tab = Tab::Settings;
+        }
         app
     }
 
@@ -119,7 +148,6 @@ impl LauncherApp {
         self.engine.is_some()
     }
 
-    /// First run with GPUs present and nothing chosen → select them all.
     fn preselect_gpus_if_empty(&mut self) {
         if self.cfg.selected_gpus.is_empty() && !self.devices.gpus.is_empty() {
             self.cfg.selected_gpus = self.devices.gpus.iter().map(|g| g.key()).collect();
@@ -138,7 +166,6 @@ impl LauncherApp {
     fn refresh_devices(&mut self) {
         if let Some(m) = &self.miner_exe {
             self.devices = devices::probe(m, &self.log_dir);
-            // Drop selections that no longer exist.
             let present: Vec<String> = self.devices.gpus.iter().map(|g| g.key()).collect();
             self.cfg.selected_gpus.retain(|k| present.contains(k));
             self.preselect_gpus_if_empty();
@@ -159,7 +186,6 @@ impl LauncherApp {
         }
     }
 
-    /// Resolve the config + detected devices into a concrete StartSpec.
     fn build_spec(&self) -> Result<StartSpec, String> {
         let miner_exe = self
             .miner_exe
@@ -219,10 +245,10 @@ impl LauncherApp {
             Ok(s) => s,
             Err(e) => {
                 self.status = format!("✗ {e}");
+                self.tab = Tab::Settings;
                 return;
             }
         };
-        // Persist choices so a restart resumes them.
         let _ = self.cfg.save(&self.config_path);
         match Engine::start(&spec) {
             Ok(engine) => {
@@ -234,8 +260,12 @@ impl LauncherApp {
                 self.rows.clear();
                 self.last_poll = Instant::now() - POLL_EVERY;
                 self.status = format!("mining started — {n} worker(s)");
+                self.tab = Tab::Dashboard;
             }
-            Err(e) => self.status = format!("✗ {e}"),
+            Err(e) => {
+                self.status = format!("✗ {e}");
+                self.tab = Tab::Settings;
+            }
         }
     }
 
@@ -272,13 +302,13 @@ impl LauncherApp {
             engine.poll();
             self.agg = engine.aggregate();
             self.rows = engine.rows();
-            self.log_lines = engine.tail_logs(40);
+            self.log_lines = engine.tail_logs(60);
             self.hashrate_history.push_back(self.agg.hashrate_total_hps as f32);
             while self.hashrate_history.len() > HISTORY_LEN {
                 self.hashrate_history.pop_front();
             }
             if self.agg.workers_alive == 0 {
-                self.status = "⚠ all workers exited — check the log below".into();
+                self.status = "⚠ all workers exited — see Logs".into();
             }
         }
     }
@@ -296,19 +326,15 @@ impl eframe::App for LauncherApp {
             ui.ctx().request_repaint_after(POLL_EVERY);
         }
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.header(ui);
-                ui.add_space(10.0);
-                self.performance_panel(ui);
-                ui.add_space(10.0);
-                self.settings_panel(ui);
-                ui.add_space(10.0);
-                self.controls_panel(ui);
-                ui.add_space(10.0);
-                self.log_panel(ui);
-            });
+        self.top_bar(ui);
+        ui.add_space(8.0);
+        self.tab_bar(ui);
+        ui.add_space(10.0);
+        match self.tab {
+            Tab::Dashboard => self.dashboard(ui),
+            Tab::Settings => self.settings(ui),
+            Tab::Logs => self.logs(ui),
+        }
 
         match self.pending.take() {
             Some(Action::Start) => self.start(),
@@ -321,41 +347,69 @@ impl eframe::App for LauncherApp {
     }
 }
 
-// --- UI sections ------------------------------------------------------------
+// --- top bar + tabs ---------------------------------------------------------
 
 impl LauncherApp {
-    fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let (dot, label) = if self.is_mining() && self.agg.connected {
-                (theme::GREEN, "LIVE")
-            } else if self.is_mining() {
-                (theme::AMBER, "CONNECTING")
-            } else {
-                (theme::DIM, "OFFLINE")
-            };
-            ui.label(RichText::new("●").color(dot).size(16.0));
-            ui.label(RichText::new("cairn").color(theme::GREEN).size(20.0).strong());
-            ui.label(RichText::new("// miner").color(theme::AMBER).size(20.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        panel(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (dot, label) = if self.is_mining() && self.agg.connected {
+                    (theme::GREEN, "LIVE")
+                } else if self.is_mining() {
+                    (theme::AMBER, "CONNECTING")
+                } else {
+                    (theme::DIM, "OFFLINE")
+                };
+                ui.label(RichText::new("●").color(dot).size(15.0));
+                ui.label(RichText::new("cairn").color(theme::GREEN).size(19.0).strong());
+                ui.label(RichText::new("// miner").color(theme::AMBER).size(19.0));
                 ui.label(RichText::new(label).color(dot).size(11.0).strong());
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.is_mining() {
+                        if big_button(ui, "■  STOP", theme::RED).clicked() {
+                            self.pending = Some(Action::Stop);
+                        }
+                    } else {
+                        let enabled = self.miner_exe.is_some();
+                        if ui.add_enabled(enabled, big("▶  START".into(), theme::GREEN)).clicked() {
+                            self.pending = Some(Action::Start);
+                        }
+                    }
+                });
             });
+            ui.add_space(2.0);
+            ui.label(RichText::new(&self.status).color(theme::DIM2).size(11.0));
         });
-        let subtitle = if self.is_mining() {
-            let pool = if self.agg.pool.is_empty() { "cairn pool".into() } else { self.agg.pool.clone() };
-            format!("{}  ·  {}/{} workers live", pool, self.agg.workers_alive, self.agg.workers_total)
-        } else {
-            "stack CSD; mark what matters.".into()
-        };
-        ui.label(RichText::new(subtitle).color(theme::DIM).size(11.0));
     }
 
-    fn performance_panel(&mut self, ui: &mut egui::Ui) {
+    fn tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (tab, label) in [
+                (Tab::Dashboard, "Dashboard"),
+                (Tab::Settings, "Settings"),
+                (Tab::Logs, "Logs"),
+            ] {
+                let selected = self.tab == tab;
+                let color = if selected { theme::GREEN } else { theme::DIM2 };
+                if ui
+                    .selectable_label(selected, RichText::new(label).color(color).size(13.0))
+                    .clicked()
+                {
+                    self.tab = tab;
+                }
+            }
+        });
+    }
+
+    // --- Dashboard tab ------------------------------------------------------
+
+    fn dashboard(&mut self, ui: &mut egui::Ui) {
         panel(ui, |ui| {
-            heading(ui, "PERFORMANCE");
             let (num, unit) = theme::split_hashrate(self.agg.hashrate_total_hps);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(num).color(theme::GREEN).size(34.0).strong());
-                ui.label(RichText::new(unit).color(theme::DIM2).size(14.0));
+                ui.label(RichText::new(num).color(theme::GREEN).size(38.0).strong());
+                ui.label(RichText::new(unit).color(theme::DIM2).size(15.0));
                 if self.is_mining() && self.agg.workers_total > 1 {
                     ui.label(
                         RichText::new(format!("across {} workers", self.agg.workers_total))
@@ -364,10 +418,8 @@ impl LauncherApp {
                     );
                 }
             });
-
             draw_sparkline(ui, &self.hashrate_history);
-            ui.add_space(8.0);
-
+            ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
                 stat_tile(ui, "ACCEPTED", &self.agg.shares_accepted.to_string(), theme::GREEN);
                 let rej = format!("{} ({:.1}%)", self.agg.shares_rejected, self.agg.reject_pct());
@@ -382,10 +434,12 @@ impl LauncherApp {
                     theme::FG,
                 );
             });
+        });
 
-            // Per-worker rows.
-            if !self.rows.is_empty() {
-                ui.add_space(8.0);
+        if !self.rows.is_empty() {
+            ui.add_space(10.0);
+            panel(ui, |ui| {
+                heading(ui, "WORKERS");
                 for r in &self.rows {
                     ui.horizontal(|ui| {
                         let dot = if r.alive && r.connected {
@@ -396,12 +450,13 @@ impl LauncherApp {
                             theme::RED
                         };
                         ui.label(RichText::new("●").color(dot).size(10.0));
-                        ui.label(RichText::new(&r.label).color(theme::DIM2).size(12.0));
+                        ui.label(RichText::new(&r.label).color(theme::FG).size(12.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new(theme::format_hashrate(r.hashrate_hps))
                                     .color(theme::GREEN)
-                                    .size(12.0),
+                                    .size(12.0)
+                                    .strong(),
                             );
                             ui.label(
                                 RichText::new(format!("acc {} · rej {}", r.accepted, r.rejected))
@@ -411,24 +466,26 @@ impl LauncherApp {
                         });
                     });
                 }
-            } else if !self.is_mining() {
-                ui.add_space(4.0);
-                ui.label(RichText::new("not mining — press Start below").color(theme::DIM).size(11.0));
-            }
-        });
+            });
+        } else if !self.is_mining() {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new("Not mining. Configure in Settings, then press START.")
+                    .color(theme::DIM)
+                    .size(12.0),
+            );
+        }
     }
 
-    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+    // --- Settings tab -------------------------------------------------------
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
         let mining = self.is_mining();
         panel(ui, |ui| {
-            heading(ui, "SETTINGS");
-
             if let Some(err) = &self.miner_err {
                 ui.label(RichText::new(format!("✗ miner unavailable: {err}")).color(theme::RED).size(11.0));
             }
-
             ui.add_enabled_ui(!mining, |ui| {
-                // Mode.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Mine with").color(theme::DIM2));
                     egui::ComboBox::from_id_salt("mode")
@@ -440,9 +497,8 @@ impl LauncherApp {
                         });
                 });
 
-                // GPU picker.
                 if self.cfg.mode.uses_gpu() {
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("GPUs").color(theme::AMBER).size(11.0).strong());
                         if ui.small_button("↻ refresh").clicked() {
@@ -451,10 +507,13 @@ impl LauncherApp {
                     });
                     if self.devices.gpus.is_empty() {
                         ui.label(
-                            RichText::new("no GPUs detected — use \"CPU only\", or check drivers and refresh")
+                            RichText::new("No GPUs detected. Use \"CPU only\", or check drivers and refresh.")
                                 .color(theme::RED)
                                 .size(11.0),
                         );
+                        for note in &self.devices.notes {
+                            ui.label(RichText::new(format!("• {note}")).color(theme::DIM).size(10.0));
+                        }
                     } else {
                         for g in self.devices.gpus.clone() {
                             let key = g.key();
@@ -472,9 +531,8 @@ impl LauncherApp {
                     }
                 }
 
-                // CPU intensity.
                 if self.cfg.mode.uses_cpu() {
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                     let cores = self.devices.cpu.logical_cores;
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("CPU intensity").color(theme::DIM2));
@@ -486,18 +544,14 @@ impl LauncherApp {
                                 }
                             });
                         ui.label(
-                            RichText::new(format!(
-                                "({} of {} cores)",
-                                self.cfg.cpu_intensity.threads(cores),
-                                cores
-                            ))
-                            .color(theme::DIM)
-                            .size(11.0),
+                            RichText::new(format!("({} of {} cores)", self.cfg.cpu_intensity.threads(cores), cores))
+                                .color(theme::DIM)
+                                .size(11.0),
                         );
                     });
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 egui::Grid::new("identity")
                     .num_columns(2)
                     .spacing([12.0, 8.0])
@@ -527,60 +581,90 @@ impl LauncherApp {
                     });
             });
 
-            if mining {
-                ui.label(RichText::new("stop mining to change settings").color(theme::DIM).size(11.0));
-            } else if ui.button("Save settings").clicked() {
-                self.pending = Some(Action::Save);
-            }
-        });
-    }
-
-    fn controls_panel(&mut self, ui: &mut egui::Ui) {
-        panel(ui, |ui| {
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if self.is_mining() {
-                    if big_button(ui, "■  STOP", theme::RED).clicked() {
-                        self.pending = Some(Action::Stop);
-                    }
-                } else {
-                    let enabled = self.miner_exe.is_some();
-                    let resp = ui.add_enabled(enabled, big(("▶  START").into(), theme::GREEN));
-                    if resp.clicked() {
-                        self.pending = Some(Action::Start);
-                    }
+                if mining {
+                    ui.label(RichText::new("stop mining to change settings").color(theme::DIM).size(11.0));
+                } else if ui.button("Save settings").clicked() {
+                    self.pending = Some(Action::Save);
                 }
-                ui.add_space(16.0);
                 let mut a = self.autostart;
                 if ui.checkbox(&mut a, "Start on Windows login").changed() {
                     self.pending = Some(Action::SetAutostart(a));
                 }
             });
-            ui.add_space(6.0);
-            ui.label(RichText::new(&self.status).color(theme::DIM2).size(12.0));
         });
     }
 
-    fn log_panel(&mut self, ui: &mut egui::Ui) {
+    // --- Logs tab -----------------------------------------------------------
+
+    fn logs(&mut self, ui: &mut egui::Ui) {
         panel(ui, |ui| {
-            heading(ui, "LOG");
+            ui.horizontal(|ui| {
+                heading_inline(ui, "LOG");
+                for (f, label) in [
+                    (LogFilter::All, "All"),
+                    (LogFilter::Warn, "Warnings"),
+                    (LogFilter::Error, "Errors"),
+                ] {
+                    let sel = self.log_filter == f;
+                    let c = if sel { theme::GREEN } else { theme::DIM2 };
+                    if ui.selectable_label(sel, RichText::new(label).color(c).size(11.0)).clicked() {
+                        self.log_filter = f;
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            let avail = ui.available_height().max(120.0);
             egui::ScrollArea::vertical()
-                .max_height(150.0)
+                .max_height(avail)
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if self.log_lines.is_empty() {
-                        ui.label(RichText::new("(no log yet)").color(theme::DIM).size(11.0));
-                    }
+                    let mut shown = 0;
                     for line in &self.log_lines {
-                        ui.label(
-                            RichText::new(line)
-                                .color(theme::DIM2)
-                                .size(11.0)
-                                .family(egui::FontFamily::Monospace),
-                        );
+                        let lvl = line_level(line);
+                        if !passes(self.log_filter, lvl) {
+                            continue;
+                        }
+                        shown += 1;
+                        let color = match lvl {
+                            Level::Error => theme::RED,
+                            Level::Warn => theme::AMBER,
+                            Level::Info => theme::DIM2,
+                        };
+                        ui.label(RichText::new(line).color(color).size(11.0).family(egui::FontFamily::Monospace));
+                    }
+                    if shown == 0 {
+                        let msg = match self.log_filter {
+                            LogFilter::All => "(no log yet — start mining)",
+                            LogFilter::Warn => "(no warnings)",
+                            LogFilter::Error => "(no errors)",
+                        };
+                        ui.label(RichText::new(msg).color(theme::DIM).size(11.0));
                     }
                 });
         });
+    }
+}
+
+// --- log helpers ------------------------------------------------------------
+
+fn line_level(line: &str) -> Level {
+    if line.contains("ERROR") {
+        Level::Error
+    } else if line.contains("WARN") {
+        Level::Warn
+    } else {
+        Level::Info
+    }
+}
+
+fn passes(filter: LogFilter, lvl: Level) -> bool {
+    match filter {
+        LogFilter::All => true,
+        LogFilter::Warn => matches!(lvl, Level::Warn | Level::Error),
+        LogFilter::Error => matches!(lvl, Level::Error),
     }
 }
 
@@ -604,6 +688,11 @@ fn heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
 }
 
+fn heading_inline(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).color(theme::AMBER).size(12.0).strong());
+    ui.add_space(8.0);
+}
+
 fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
     egui::Frame::new()
         .fill(theme::PANEL2)
@@ -619,8 +708,8 @@ fn stat_tile(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
 }
 
 fn big(text: String, color: Color32) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text).color(color).size(16.0).strong())
-        .min_size(egui::vec2(150.0, 40.0))
+    egui::Button::new(RichText::new(text).color(color).size(15.0).strong())
+        .min_size(egui::vec2(140.0, 36.0))
         .stroke(egui::Stroke::new(1.0, color))
         .fill(theme::PANEL2)
 }
@@ -630,7 +719,7 @@ fn big_button(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
 }
 
 fn draw_sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>) {
-    let height = 90.0;
+    let height = 100.0;
     let (rect, _r) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -685,5 +774,17 @@ mod tests {
         );
         assert!(valid_address(&normalize_address("0xABCDEF0123456789abcdef0123456789ABCDEF01")));
         assert!(!valid_address("tooshort"));
+    }
+
+    #[test]
+    fn log_level_detection_and_filter() {
+        assert_eq!(line_level("[gpu0] 2026 ERROR boom"), Level::Error);
+        assert_eq!(line_level("[cpu] 2026  WARN careful"), Level::Warn);
+        assert_eq!(line_level("[gpu0] 2026  INFO ok"), Level::Info);
+        assert!(passes(LogFilter::All, Level::Info));
+        assert!(!passes(LogFilter::Warn, Level::Info));
+        assert!(passes(LogFilter::Warn, Level::Error));
+        assert!(passes(LogFilter::Error, Level::Error));
+        assert!(!passes(LogFilter::Error, Level::Warn));
     }
 }
