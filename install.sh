@@ -5,7 +5,7 @@ set -euo pipefail
 #  cairn-miner - one-line installer for Linux.
 #
 #  Quick start (auto-detects GPU, mines to the cairn pool):
-#     curl -fsSL https://raw.githubusercontent.com/InverseAltruism/cairn-miner/master/install.sh | CAIRN_ADDR=<addr20> bash
+#     curl -fsSL https://raw.githubusercontent.com/InverseAltruism/cairn-miner/main/install.sh | CAIRN_ADDR=<addr20> bash
 #
 #  What it does:
 #     1. Detects your GPU (NVIDIA -> cuda, AMD -> opencl) or falls back to CPU.

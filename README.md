@@ -18,7 +18,7 @@ phone-home, and **no bundled relay** that follows a remote blacklist.
 ### Linux (one line)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/InverseAltruism/cairn-miner/master/install.sh | CAIRN_ADDR=<your-addr20> bash
+curl -fsSL https://raw.githubusercontent.com/InverseAltruism/cairn-miner/main/install.sh | CAIRN_ADDR=<your-addr20> bash
 ```
 
 Auto-detects your GPU, installs the matching build (or compiles from source if
