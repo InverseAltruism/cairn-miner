@@ -1,0 +1,69 @@
+[package]
+name        = "cairn-miner"
+repository  = "https://github.com/InverseAltruism/cairn-miner"
+version     = "0.1.0"
+edition     = "2021"
+rust-version = "1.75"
+license     = "MIT OR Apache-2.0"
+description = "cairn-miner - open GPU/CPU Stratum miner for Compute Substrate (CSD). Defaults to the cairn pool; --pool points it anywhere."
+
+[lib]
+name = "cairn_miner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cairn-miner"
+path = "src/main.rs"
+
+[features]
+# Default is CPU-only so the crate builds with no GPU toolchain present.
+# Enable a GPU backend explicitly, e.g.:
+#   cargo build --release --features cuda
+#   cargo build --release --features opencl
+#   cargo build --release --features "cuda,opencl"   # auto-pick best at runtime
+default     = ["cpu-only"]
+cuda        = ["dep:cudarc"]
+opencl      = ["dep:opencl3"]
+# Explicit CPU-only marker (no GPU toolchain required). Carries no deps.
+cpu-only    = []
+
+[dependencies]
+anyhow      = "1.0"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+toml        = "0.8"
+hex         = "0.4"
+sha2        = { version = "0.10", features = ["compress"] }
+rand        = "0.8"
+rand_chacha = "0.3"
+# Wallet keygen (`newwallet` subcommand). Versions pinned to MATCH the CSD chain
+# (compute-substrate) so addr20 derivation is byte-identical and spendable:
+#   addr20 = RIPEMD160(SHA256(compressed_secp256k1_pubkey)).
+# secp256k1 0.29 + ripemd 0.1 are exactly what the chain's Cargo.toml uses.
+secp256k1   = { version = "0.29", features = ["rand", "global-context"] }
+ripemd      = "0.1"
+humantime   = "2"
+clap        = { version = "4.5", features = ["derive"] }
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender   = "0.2"
+ctrlc       = "3"
+
+# Optional GPU backends; the default CPU-only build pulls in neither, and neither
+# needs a GPU toolchain on the BUILD host. CUDA embeds a pre-built PTX (see
+# src/backends/cuda.rs) and JITs it via the NVIDIA driver at runtime — never via
+# NVRTC — so only the driver is required at runtime, no CUDA Toolkit. The `nvrtc`
+# feature stays ONLY because cudarc's `Ptx` type (consumed by `load_module`) lives
+# behind it; the NVRTC compiler itself is never invoked.
+cudarc      = { version = "0.19", features = ["cuda-13020", "driver", "nvrtc"], optional = true }
+opencl3     = { version = "0.9", optional = true }
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+debug         = false
+strip         = true
+# unwind (not abort) so the miner can catch panics from cudarc when an
+# incompatible CUDA toolkit is installed, and fall back to OpenCL cleanly.
+panic         = "unwind"

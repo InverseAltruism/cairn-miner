@@ -1,0 +1,5 @@
+/target
+/logs
+*.current.log
+csd-wallet.txt
+config.toml

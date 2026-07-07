@@ -1,0 +1,24 @@
+cairn-miner
+Copyright 2026 InverseAltruism / the cairn project
+
+This product is licensed under the terms of the MIT OR Apache-2.0 license (see
+LICENSE-MIT and LICENSE-APACHE).
+
+-------------------------------------------------------------------------------
+Attribution
+-------------------------------------------------------------------------------
+
+cairn-miner is a fork of the Compute Substrate pool miner as it stood at its
+v0.1.6 tag, which was released under "MIT OR Apache-2.0". That grant is
+irrevocable and cairn-miner reuses only that MIT/Apache-licensed v0.1.6 code.
+
+cairn-miner does NOT incorporate any code from v0.1.7 or later of that project,
+which was relicensed under PolyForm Perimeter 1.0.0 (a source-available,
+anti-compete license).
+
+Trademarks — including "CSD Pool Miner", "Compute Substrate", "CSD", and the
+associated logos — remain the property of their respective owners and are NOT
+claimed by this fork. cairn-miner uses the chain name only nominatively, to
+state compatibility ("a miner for the Compute Substrate / CSD chain"). All
+cairn-specific branding, the default pool endpoint, the `--pool` override, the
+failover client, and the onboarding tooling are original to this fork.
