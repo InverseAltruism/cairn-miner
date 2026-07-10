@@ -20,7 +20,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -60,6 +60,10 @@ pub struct StratumJob {
 struct SubmitAck {
     id: Option<u64>,
     result: Option<bool>,
+    /// Pool error for a rejected share, e.g. `[21, "Job not found", null]`.
+    /// `null` on acceptance or when the pool omits it.
+    #[serde(default)]
+    error: serde_json::Value,
 }
 
 /// Shared state the reader thread writes and the mining thread reads.
@@ -96,7 +100,14 @@ impl Shared {
 
 /// A connected Stratum v1 client.
 pub struct StratumClient {
-    endpoint: String,
+    /// All pool endpoints provided at startup (primary first). The reader
+    /// thread walks this list during reconnect: a few failures on the current
+    /// endpoint advance `endpoint_idx` round-robin; a successful connect resets
+    /// it to 0 (primary).
+    endpoints: Vec<String>,
+    /// Index into `endpoints` of the endpoint we last connected to (or are
+    /// currently trying). Protected by the reconnect loop (single writer).
+    endpoint_idx: Arc<AtomicUsize>,
     worker_addr: String,
     shared: Arc<Shared>,
     /// Write half of the socket. The reader thread holds its own cloned read
@@ -145,6 +156,25 @@ impl StratumClient {
         worker_addr: &str,
         stats: Arc<MinerStats>,
     ) -> Result<Self> {
+        Self::connect_with_stats_and_endpoints(
+            endpoint,
+            worker_addr,
+            stats,
+            vec![endpoint.to_string()],
+        )
+    }
+
+    /// Full constructor: like [`connect_with_stats`](Self::connect_with_stats)
+    /// but accepts the complete ordered failover list so the reader's reconnect
+    /// loop can rotate through all endpoints rather than hammering a single one.
+    /// `endpoint` is the initial (primary) endpoint to connect to first;
+    /// `endpoints` is the full ordered list (primary first).
+    pub fn connect_with_stats_and_endpoints(
+        endpoint: &str,
+        worker_addr: &str,
+        stats: Arc<MinerStats>,
+        endpoints: Vec<String>,
+    ) -> Result<Self> {
         let hs = Self::handshake(endpoint, worker_addr)
             .with_context(|| format!("stratum handshake to {endpoint}"))?;
 
@@ -175,8 +205,19 @@ impl StratumClient {
             dispatch_frame(push, &shared);
         }
 
+        // The initial connection is to endpoints[0] by construction (main.rs
+        // walks the list and calls us with the first endpoint that answered).
+        // Record which index that corresponds to so the reconnect loop starts
+        // from the right position.
+        let initial_idx = endpoints
+            .iter()
+            .position(|e| e == endpoint)
+            .unwrap_or(0);
+        let endpoint_idx = Arc::new(AtomicUsize::new(initial_idx));
+
         let reader = Self::spawn_reader(
-            endpoint.to_string(),
+            endpoints.clone(),
+            Arc::clone(&endpoint_idx),
             worker_addr.to_string(),
             hs.reader,
             Arc::clone(&shared),
@@ -188,7 +229,8 @@ impl StratumClient {
         );
 
         Ok(StratumClient {
-            endpoint: endpoint.to_string(),
+            endpoints,
+            endpoint_idx,
             worker_addr: worker_addr.to_string(),
             shared,
             writer,
@@ -322,8 +364,12 @@ impl StratumClient {
     /// dispatching `mining.notify` → latest_job and `mining.set_difficulty` →
     /// difficulty. On any read error/timeout/EOF it reconnects with capped
     /// backoff (re-subscribe/re-authorize) unless shutdown was signalled.
+    ///
+    /// `endpoints` is the full ordered failover list; `endpoint_idx` tracks
+    /// which one we are currently on so the reconnect loop can rotate forward.
     fn spawn_reader(
-        endpoint: String,
+        endpoints: Vec<String>,
+        endpoint_idx: Arc<AtomicUsize>,
         worker_addr: String,
         initial_reader: BufReader<TcpStream>,
         shared: Arc<Shared>,
@@ -349,8 +395,9 @@ impl StratumClient {
                             if shared.shutdown.load(Ordering::Relaxed) {
                                 return;
                             }
+                            let ep = &endpoints[endpoint_idx.load(Ordering::Relaxed)];
                             tracing::warn!(
-                                "stratum: connection closed by {endpoint}, reconnecting"
+                                "stratum: connection closed by {ep}, reconnecting"
                             );
                             true
                         }
@@ -363,8 +410,9 @@ impl StratumClient {
                             if shared.shutdown.load(Ordering::Relaxed) {
                                 return;
                             }
+                            let ep = &endpoints[endpoint_idx.load(Ordering::Relaxed)];
                             tracing::warn!(
-                                "stratum: read error from {endpoint}: {e}; reconnecting"
+                                "stratum: read error from {ep}: {e}; reconnecting"
                             );
                             true
                         }
@@ -372,7 +420,8 @@ impl StratumClient {
 
                     if needs_reconnect
                         && !reconnect(
-                            &endpoint,
+                            &endpoints,
+                            &endpoint_idx,
                             &worker_addr,
                             &shared,
                             &writer,
@@ -421,9 +470,9 @@ impl StratumClient {
         self.shared.extranonce2_size.load(Ordering::Relaxed) as usize
     }
 
-    /// The pool endpoint this client is connected to.
+    /// The pool endpoint this client is currently connected to.
     pub fn endpoint(&self) -> &str {
-        &self.endpoint
+        &self.endpoints[self.endpoint_idx.load(Ordering::Relaxed)]
     }
 
     /// The worker (csd1) address this client authorized as.
@@ -493,7 +542,24 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                 if ack.id.map(|id| id >= 100).unwrap_or(false) {
                     match ack.result {
                         Some(true) => shared.stats.on_share_accepted(),
-                        _ => shared.stats.on_share_rejected(),
+                        _ => {
+                            shared.stats.on_share_rejected();
+                            // Emit a visible warning so headless operators
+                            // (HiveOS/systemd) see rejects in the log rather
+                            // than only in the counters. Include the pool's
+                            // error payload when present.
+                            let err_detail = if ack.error.is_null() {
+                                String::new()
+                            } else {
+                                format!(" (pool error: {})", ack.error)
+                            };
+                            let accepted = shared.stats.snapshot().shares_accepted;
+                            let rejected = shared.stats.snapshot().shares_rejected;
+                            tracing::warn!(
+                                "stratum: share REJECTED{err_detail} \
+                                 [accepted={accepted} rejected={rejected}]"
+                            );
+                        }
                     }
                 }
             }
@@ -544,33 +610,62 @@ fn dispatch_frame(line: &str, shared: &Shared) {
     }
 }
 
-/// Reconnect with capped exponential backoff: sleep, re-run the handshake, and
-/// on success swap in the fresh write half + reader stream and refresh the
-/// session extranonce1/size. Returns `false` iff shutdown was requested (so the
-/// reader loop should exit); `true` once reconnected.
+/// How many consecutive failures on one endpoint before we rotate to the next.
+/// Two attempts gives the current endpoint a fair chance to recover from a
+/// brief restart before we give up on it.
+const ENDPOINT_TRIES_BEFORE_ROTATE: u32 = 2;
+
+/// Reconnect with capped exponential backoff and jitter: sleep, re-run the
+/// handshake, and on success swap in the fresh write half + reader stream and
+/// refresh the session extranonce1/size. Returns `false` iff shutdown was
+/// requested (so the reader loop should exit); `true` once reconnected.
+///
+/// **Endpoint rotation**: after [`ENDPOINT_TRIES_BEFORE_ROTATE`] consecutive
+/// failures on the current endpoint the function advances `endpoint_idx`
+/// round-robin to the next one in `endpoints`. A successful connect resets the
+/// index to 0 (primary) and resets the backoff.
+///
+/// **Jitter**: each backoff sleep is multiplied by a random factor in
+/// `0.5..1.5` drawn from `rand::thread_rng()`. This breaks the thundering-herd
+/// of many miners reconnecting in sync after a pool restart: their sleeps
+/// spread out by up to ±50 % instead of all firing simultaneously.
 ///
 /// The backoff doubles each failed attempt up to [`BACKOFF_MAX`]; a successful
 /// reconnect resets it (the caller also resets on the next healthy read).
 fn reconnect(
-    endpoint: &str,
+    endpoints: &[String],
+    endpoint_idx: &Arc<AtomicUsize>,
     worker_addr: &str,
     shared: &Arc<Shared>,
     writer: &Arc<Mutex<TcpStream>>,
     reader: &mut BufReader<TcpStream>,
     backoff: &mut Duration,
 ) -> bool {
+    use rand::Rng;
+
     // We're between sockets until the handshake below succeeds.
     shared.stats.set_connected(false);
+
+    // Consecutive failures against the current endpoint; triggers rotation.
+    let mut tries_on_current: u32 = 0;
+
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
             return false;
         }
 
-        std::thread::sleep(*backoff);
+        // Apply jitter: multiply the base backoff by a random factor in 0.5..1.5
+        // so reconnecting miners don't all wake simultaneously after a pool restart.
+        let jitter: f64 = rand::thread_rng().gen_range(0.5..1.5);
+        let sleep_dur = backoff.mul_f64(jitter).min(BACKOFF_MAX);
+        std::thread::sleep(sleep_dur);
 
         if shared.shutdown.load(Ordering::Relaxed) {
             return false;
         }
+
+        let idx = endpoint_idx.load(Ordering::Relaxed);
+        let endpoint = &endpoints[idx];
 
         match StratumClient::handshake(endpoint, worker_addr) {
             Ok(hs) => {
@@ -598,6 +693,9 @@ fn reconnect(
                     let _ = w.shutdown(std::net::Shutdown::Both);
                     *w = hs.write_stream;
                 }
+
+                // Successful connect: reset to the primary endpoint and clear backoff.
+                endpoint_idx.store(0, Ordering::Relaxed);
                 *backoff = BACKOFF_MIN;
                 shared.stats.set_connected(true);
                 tracing::info!("stratum: reconnected to {endpoint}");
@@ -605,10 +703,29 @@ fn reconnect(
             }
             Err(e) => {
                 tracing::warn!("stratum: reconnect to {endpoint} failed: {e}");
+                tries_on_current += 1;
+
+                // After a couple of failures, rotate to the next endpoint so a
+                // dead pool doesn't block us from the backup indefinitely.
+                if tries_on_current >= ENDPOINT_TRIES_BEFORE_ROTATE && endpoints.len() > 1 {
+                    let next = (idx + 1) % endpoints.len();
+                    endpoint_idx.store(next, Ordering::Relaxed);
+                    tries_on_current = 0;
+                    // Reset backoff when switching endpoints so we try the new
+                    // one promptly rather than sleeping the full doubled delay.
+                    *backoff = BACKOFF_MIN;
+                    tracing::info!(
+                        "stratum: rotating to next endpoint {} ({}/{})",
+                        endpoints[next],
+                        next + 1,
+                        endpoints.len(),
+                    );
+                    continue; // skip the backoff bump below; we just reset it
+                }
             }
         }
 
-        // Bump backoff, capped.
+        // Bump backoff, capped (only reached on failure without rotation).
         *backoff = (*backoff * 2).min(BACKOFF_MAX);
     }
 }
