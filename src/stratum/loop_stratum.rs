@@ -503,9 +503,15 @@ pub fn run_stratum<B: MiningBackend>(
                         let ghs_gpu = (gpu_nonces_since_log as f64) / 1e9 / elapsed;
                         let mhs_cpu = (cpu_nonces_since_log as f64) / 1e6 / elapsed;
                         let combined_ghs = ghs_gpu + (mhs_cpu / 1000.0);
+                        // Include the running share tally so headless operators
+                        // (HiveOS/systemd) can see the accepted/rejected counts
+                        // in the periodic log without needing the stats endpoint.
+                        let snap = stats.snapshot();
                         tracing::info!(
-                            "stratum hashrate gpu={:.2} GH/s cpu={:.2} MH/s combined={:.2} GH/s (job={}, diff={:.2})",
+                            "stratum hashrate gpu={:.2} GH/s cpu={:.2} MH/s combined={:.2} GH/s \
+                             (job={}, diff={:.2}, shares accepted={} rejected={})",
                             ghs_gpu, mhs_cpu, combined_ghs, mapped.job_id, difficulty,
+                            snap.shares_accepted, snap.shares_rejected,
                         );
                         last_hashrate_log = Instant::now();
                         gpu_nonces_since_log = 0;

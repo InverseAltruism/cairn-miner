@@ -473,7 +473,12 @@ fn run() -> Result<()> {
     let mut last_err = None;
     for endpoint in &pools {
         tracing::info!("cairn-miner: connecting to pool {endpoint} as {auth_username}");
-        match StratumClient::connect_with_stats(endpoint, &auth_username, stats.clone()) {
+        match StratumClient::connect_with_stats_and_endpoints(
+            endpoint,
+            &auth_username,
+            stats.clone(),
+            pools.clone(),
+        ) {
             Ok(c) => {
                 client = Some(c);
                 break;
@@ -631,8 +636,15 @@ fn run() -> Result<()> {
                     "auto: trying OpenCL geom={}x{}x{}",
                     cli.blocks, cli.threads_per_block, cli.nonces_per_thread
                 );
-                match OpenclBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread) {
-                    Ok(b) => {
+                // Some AMD ICDs panic (rather than return Err) during platform
+                // enumeration or context creation. Catch the panic so `auto`
+                // falls through to CPU instead of aborting. Mirrors the CUDA
+                // sibling above and the forced `--backend opencl` path.
+                let opencl_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    OpenclBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
+                }));
+                match opencl_result {
+                    Ok(Ok(b)) => {
                         tracing::info!(
                             "auto: SELECTED opencl (geom={}x{}x{} = {} nonces/launch, 2-queue pipelined)",
                             b.blocks, b.threads_per_block, b.nonces_per_thread,
@@ -640,8 +652,21 @@ fn run() -> Result<()> {
                         );
                         return run_stratum(&b, &client, stop, build_mining_config(&cli, false));
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!("auto: OpenCL init failed: {}", e);
+                    }
+                    Err(p) => {
+                        let msg = if let Some(s) = p.downcast_ref::<&'static str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = p.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic>".to_string()
+                        };
+                        tracing::warn!(
+                            "auto: OpenCL init panicked (broken AMD ICD?): {}",
+                            msg
+                        );
                     }
                 }
             }

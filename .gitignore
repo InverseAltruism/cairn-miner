@@ -16,3 +16,4 @@ csd-wallet.txt
 # OS / editor cruft
 .DS_Store
 *.swp
+.omc/
