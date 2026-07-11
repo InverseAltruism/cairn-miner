@@ -34,10 +34,14 @@ cp "$BIN" "$pkg/cairn-miner"
 chmod +x "$pkg"/h-*.sh "$pkg/cairn-miner"
 
 # Stamp the manifest version from the release tag (e.g. "0.2.3") so HiveOS shows
-# the right version. Only touch it for a plausible version string.
-if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
-  sed -i -E "s/^CUSTOM_VERSION=.*/CUSTOM_VERSION=${VERSION}/" "$pkg/h-manifest.conf"
+# the right version. Only touch it for a fully-anchored version string, and use a
+# sed delimiter that cannot appear in a version so a stray char can't break the
+# script (which runs under `set -e`).
+if printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+  sed -i -E "s|^CUSTOM_VERSION=.*|CUSTOM_VERSION=${VERSION}|" "$pkg/h-manifest.conf"
   echo "stamped CUSTOM_VERSION=${VERSION}"
+else
+  [ -n "$VERSION" ] && echo "note: version '$VERSION' not a plain semver; leaving manifest default"
 fi
 
 # HiveOS expects the miner dir at the tar root.

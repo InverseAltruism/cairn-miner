@@ -399,6 +399,11 @@ pub fn run_stratum<B: MiningBackend>(
                 iter_stop.store(true, Ordering::Release);
             });
 
+            // Wall time of the HASHING span only — captured before the error
+            // backoff below so a transient-fault sleep can't fool the chunk-size
+            // auto-tuner into shrinking chunk_size on a healthy device.
+            let chunk_elapsed = chunk_t0.elapsed();
+
             // Interpret the GPU outcome. An error is NOT "found nothing": count
             // it, and if the device keeps failing, exit so a supervisor restarts
             // the rig. Only credit hashrate for nonces the GPU ACTUALLY hashed
@@ -570,7 +575,7 @@ pub fn run_stratum<B: MiningBackend>(
             // every backend — but only after a full sweep, since a find
             // early-exits the backend and would skew the measured rate.
             if !found {
-                let ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
+                let ms = chunk_elapsed.as_secs_f64() * 1000.0;
                 if ms > 1.0 {
                     let scaled = (chunk_size as f64 * (CHUNK_TARGET_MS / ms))
                         .clamp(CHUNK_MIN as f64, CHUNK_MAX as f64);

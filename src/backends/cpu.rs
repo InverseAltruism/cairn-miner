@@ -6,7 +6,7 @@
 //! kernel exactly and is also the only backend that runs out-of-the-box
 //! on every platform — perfect for end-to-end smoke testing.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use crate::backend::{HashOutcome, MiningBackend, MiningResult};
@@ -62,7 +62,12 @@ impl MiningBackend for CpuBackend {
         // `batch_matches_reference` and end-to-end by `selftest`).
         let hasher = BatchHasher::new(&header_84);
 
-        let next_nonce = AtomicU32::new(nonce_start);
+        // The cursor is u64 so `fetch_add` can step past `nonce_end` (up to
+        // u32::MAX) without wrapping the u32 nonce space — a u32 cursor near the
+        // top of the range wraps to a low value, the `>= nonce_end` guard never
+        // fires, and every thread re-sweeps forever (an infinite hang the miner
+        // hits once its sweep reaches the top of the space).
+        let next_nonce = AtomicU64::new(nonce_start as u64);
         let found = std::sync::Arc::new(std::sync::Mutex::new(None::<MiningResult>));
         let local_stop = AtomicBool::new(false);
         // Nonces actually hashed across all threads → honest hashrate. The CPU
@@ -97,15 +102,18 @@ impl MiningBackend for CpuBackend {
                         // atomic. A multiple of BATCH_LANES so the batch loop
                         // divides evenly except at the final clamp.
                         const CHUNK: u32 = 4096;
-                        let start = next_nonce.fetch_add(CHUNK, Ordering::Relaxed);
-                        if start >= nonce_end {
+                        let start_u64 = next_nonce.fetch_add(CHUNK as u64, Ordering::Relaxed);
+                        if start_u64 >= nonce_end as u64 {
                             break 'sweep;
                         }
+                        // start < nonce_end <= u32::MAX, so it fits a u32.
+                        let start = start_u64 as u32;
                         let end = start.saturating_add(CHUNK).min(nonce_end);
                         let lanes = BATCH_LANES as u32;
                         let mut n = start;
-                        // Full interleaved batches.
-                        while n + lanes <= end {
+                        // Full interleaved batches. `end - n` (never `n + lanes`)
+                        // so the check can't overflow when end is near u32::MAX.
+                        while end - n >= lanes {
                             let mut out = [[0u8; 32]; BATCH_LANES];
                             hasher.hash_batch::<BATCH_LANES>(n, &mut out);
                             local_done += lanes as u64;
@@ -138,5 +146,41 @@ impl MiningBackend for CpuBackend {
             result,
             nonces_done: swept.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a range ending at u32::MAX must TERMINATE. With the old u32
+    /// cursor (and the old `n + lanes` batch check) the sweep overflowed past
+    /// nonce_end, wrapped to low nonces, and re-swept forever. This test would
+    /// hang without the u64-cursor / `end - n` fixes.
+    #[test]
+    fn terminates_at_top_of_nonce_space() {
+        let backend = CpuBackend::new(2);
+        let header = [0u8; 84];
+        // All-zero target: no real sha256d hash is <= 0, so it sweeps the whole
+        // range and returns None (never finds), exercising full termination.
+        let target = [0u8; 32];
+        let stop = AtomicBool::new(false);
+        let start = u32::MAX - 10;
+        let out = backend
+            .hash_range(header, target, start, u32::MAX, &stop)
+            .expect("cpu backend never errors");
+        assert!(out.result.is_none());
+        // Swept exactly [u32::MAX-10, u32::MAX): 10 nonces, no wrap re-sweep.
+        assert_eq!(out.nonces_done, 10);
+    }
+
+    #[test]
+    fn honest_nonces_done_over_a_small_range() {
+        let backend = CpuBackend::new(2);
+        let out = backend
+            .hash_range([0u8; 84], [0u8; 32], 100, 4200, &AtomicBool::new(false))
+            .unwrap();
+        assert!(out.result.is_none());
+        assert_eq!(out.nonces_done, 4100); // [100, 4200)
     }
 }

@@ -223,7 +223,13 @@ impl MiningBackend for OpenclBackend {
                 // race with the next job.
                 let (other, oqueue) = pick_pipe(&mut a, &mut b, current_pipe ^ 1, &self.queue_a, &self.queue_b);
                 if other.in_flight {
-                    let _ = drain_pipe(oqueue, other);
+                    // We're returning the just-found share regardless, but don't
+                    // silently swallow a device fault on the idle pipe — log it
+                    // so a half-dead card is visible (it also resurfaces on the
+                    // next call, which rebuilds both pipes fresh).
+                    if let Err(e) = drain_pipe(oqueue, other) {
+                        tracing::warn!("opencl: draining idle pipe after a find failed: {e:#}");
+                    }
                     other.in_flight = false;
                 }
                 return Ok(HashOutcome {
