@@ -125,8 +125,31 @@ jobs:
         run: |
           cargo build --release --features opencl
           cp target/release/cairn-miner dist/cairn-miner-linux-opencl-x86_64
-      - name: Build HiveOS package (bundles the CPU seed)
-        run: bash packaging/build-hiveos-package.sh dist/cairn-miner-linux-cpu-x86_64 dist/cairn-miner-hiveos.tar.gz
+      # HiveOS binary: an all-backends (cuda+opencl) build against the glibc
+      # floor so ONE binary drives NVIDIA (cuda) and AMD (opencl) rigs, with a
+      # cpu fallback. Best-effort; the pick step below falls back to cuda then
+      # cpu. HiveOS ships the OpenCL loader + NVIDIA stack, so the opencl link
+      # resolves at runtime.
+      - name: Build all-backends (cuda+opencl) for HiveOS, glibc 2.27 floor
+        continue-on-error: true
+        run: |
+          cargo zigbuild --release --features "cuda,opencl" --target x86_64-unknown-linux-gnu.2.27
+          cp target/x86_64-unknown-linux-gnu/release/cairn-miner dist/cairn-miner-linux-allgpu-x86_64
+      - name: Pick the HiveOS binary (all-backends > cuda > cpu)
+        id: pick_hiveos
+        run: |
+          if [ -f dist/cairn-miner-linux-allgpu-x86_64 ]; then
+            echo "bin=dist/cairn-miner-linux-allgpu-x86_64" >> "$GITHUB_OUTPUT"
+            echo "HiveOS binary: all-backends (cuda+opencl)"
+          elif [ -f dist/cairn-miner-linux-cuda-x86_64 ]; then
+            echo "bin=dist/cairn-miner-linux-cuda-x86_64" >> "$GITHUB_OUTPUT"
+            echo "::warning::all-backends build unavailable; HiveOS binary is CUDA-only (NVIDIA rigs only)"
+          else
+            echo "bin=dist/cairn-miner-linux-cpu-x86_64" >> "$GITHUB_OUTPUT"
+            echo "::warning::no GPU binary available; HiveOS package will be CPU-only (rigs cannot GPU-mine)"
+          fi
+      - name: Build HiveOS package (GPU binary + tag-stamped version)
+        run: bash packaging/build-hiveos-package.sh "${{ steps.pick_hiveos.outputs.bin }}" dist/cairn-miner-hiveos.tar.gz "${GITHUB_REF_NAME#v}"
       - name: Upload linux artifacts
         uses: actions/upload-artifact@v4
         with: { name: linux, path: dist/* }

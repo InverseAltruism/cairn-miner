@@ -11,9 +11,10 @@
 # worst case one card mines, never a bricked rig. No set -e anywhere.
 #
 # Each worker exposes a loopback stats port (BASE + device index); h-stats.sh
-# scrapes them via `cairn-miner hiveos-stats`. We pass --stats-port ONLY: the
-# stats server always binds 127.0.0.1, and there is no --stats-bind flag (passing
-# one makes clap exit 2 and crash-loops the rig — the historical HiveOS bug).
+# scrapes them via `cairn-miner hiveos-stats`. We pass --stats-port ONLY (the
+# stats server always binds 127.0.0.1). Do NOT add a stats "bind" flag — the CLI
+# defines no such flag, and passing an unknown one makes clap exit 2 and
+# crash-loops the rig (the historical HiveOS bug this file fixes).
 #
 # Deliberately NO relay node and NO phone-home: cairn-miner ships nothing that
 # follows a remote blacklist or reports your rig anywhere.
@@ -31,7 +32,8 @@ PIDFILE="$(pwd)/.cairn-sup.pids"
 : > "$PIDFILE"
 
 # --stats-port <BASE+dev> if this binary advertises the flag; empty otherwise
-# (an older binary without it just mines, no stats endpoint).
+# (an older binary without it just mines, no stats endpoint). Note: only the
+# port flag is ever passed — see the header note above.
 HAS_STATS=0
 if "$BIN" --help 2>/dev/null | grep -q -- '--stats-port'; then
   HAS_STATS=1
