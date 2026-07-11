@@ -15,6 +15,9 @@ addr="${tmpl%%.*}"
 worker="${WORKER_NAME:-$(hostname)}"
 [[ "$tmpl" == *.* ]] && worker="${tmpl#*.}"
 addr="${addr#0x}"
+# The miner requires lowercase hex and hard-rejects uppercase (a checksummed or
+# copy-pasted address would otherwise crash-loop the rig). Normalize here.
+addr="${addr,,}"
 
 # Pool: default to the public cairn pool; strip any stratum+tcp:// prefix.
 pool="${CUSTOM_URL:-cairn-pool.com:3333}"
