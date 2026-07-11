@@ -246,7 +246,17 @@ fn eval_backend(
         let elapsed_micros = started.elapsed().as_micros();
         total_micros += elapsed_micros;
 
-        match res {
+        let outcome = match res {
+            Ok(o) => o,
+            Err(e) => {
+                // A device error is a real failure, not a silent "no solution".
+                notes.push(format!("trial {}: backend error: {:#}", trial, e));
+                pass = false;
+                continue;
+            }
+        };
+
+        match outcome.result {
             Some(MiningResult { nonce, hash }) => {
                 total_solves += 1;
 

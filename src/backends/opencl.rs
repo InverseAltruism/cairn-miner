@@ -22,7 +22,7 @@ use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_WRITE_ONLY};
 use opencl3::program::Program;
 use opencl3::types::{cl_uchar, cl_uint, CL_BLOCKING};
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{HashOutcome, MiningBackend, MiningResult};
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
 const KERNEL_SRC: &str = include_str!("../kernels/sha256d.cl");
@@ -157,9 +157,9 @@ impl MiningBackend for OpenclBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
-    ) -> Option<MiningResult> {
+    ) -> Result<HashOutcome> {
         if nonce_end <= nonce_start {
-            return None;
+            return Ok(HashOutcome::none(0));
         }
 
         let midstate = midstate_of_first_chunk(&header_84);
@@ -170,36 +170,25 @@ impl MiningBackend for OpenclBackend {
         let mut tail_16 = [0u8; 16];
         tail_16.copy_from_slice(&header_84[64..80]);
 
-        let mut a = match PipeRes::new(&self.context, &self.program) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("opencl: pipe A setup failed: {}", e);
-                return None;
-            }
-        };
-        let mut b = match PipeRes::new(&self.context, &self.program) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("opencl: pipe B setup failed: {}", e);
-                return None;
-            }
-        };
+        // Pipe/buffer setup failures are real device errors → surface them so
+        // the caller can restart, never a silent "found nothing".
+        let mut a = PipeRes::new(&self.context, &self.program)
+            .map_err(|e| anyhow!("opencl pipe A setup: {e}"))?;
+        let mut b = PipeRes::new(&self.context, &self.program)
+            .map_err(|e| anyhow!("opencl pipe B setup: {e}"))?;
 
         // Upload constants once per pipe.
         for (queue, pipe) in [(&self.queue_a, &mut a), (&self.queue_b, &mut b)] {
             unsafe {
                 queue
                     .enqueue_write_buffer(&mut pipe.mid_buf, CL_BLOCKING, 0, &midstate_words, &[])
-                    .map_err(|e| anyhow!("write midstate: {:?}", e))
-                    .ok()?;
+                    .map_err(|e| anyhow!("opencl write midstate: {e:?}"))?;
                 queue
                     .enqueue_write_buffer(&mut pipe.tail_buf, CL_BLOCKING, 0, &tail_16, &[])
-                    .map_err(|e| anyhow!("write tail: {:?}", e))
-                    .ok()?;
+                    .map_err(|e| anyhow!("opencl write tail: {e:?}"))?;
                 queue
                     .enqueue_write_buffer(&mut pipe.target_buf, CL_BLOCKING, 0, &target, &[])
-                    .map_err(|e| anyhow!("write target: {:?}", e))
-                    .ok()?;
+                    .map_err(|e| anyhow!("opencl write target: {e:?}"))?;
             }
         }
 
@@ -208,18 +197,21 @@ impl MiningBackend for OpenclBackend {
         let global = (self.blocks as usize) * local_size;
         let mut next_start: u64 = nonce_start as u64;
         let mut current_pipe = 0u8;
+        // Nonces launched so far → honest hashrate on every exit path.
+        let done = |next: u64| next.saturating_sub(nonce_start as u64);
 
         loop {
             if stop.load(Ordering::Relaxed) {
-                return None;
+                return Ok(HashOutcome::none(done(next_start)));
             }
 
             // 1) Drain the current pipe if in flight (no borrow of "other"
-            //    needed yet — keeps the borrow checker happy).
+            //    needed yet — keeps the borrow checker happy). A read fault is
+            //    a real error (`?`), not "no solution".
             let drain_result = {
                 let (pipe, queue) = pick_pipe(&mut a, &mut b, current_pipe, &self.queue_a, &self.queue_b);
                 if pipe.in_flight {
-                    let res = drain_pipe(queue, pipe);
+                    let res = drain_pipe(queue, pipe)?;
                     pipe.in_flight = false;
                     res
                 } else {
@@ -234,7 +226,10 @@ impl MiningBackend for OpenclBackend {
                     let _ = drain_pipe(oqueue, other);
                     other.in_flight = false;
                 }
-                return Some(res);
+                return Ok(HashOutcome {
+                    result: Some(res),
+                    nonces_done: done(next_start),
+                });
             }
 
             // 2) Launch the next batch on this pipe (if there's nonce space left).
@@ -246,22 +241,13 @@ impl MiningBackend for OpenclBackend {
                         let start_u32 = next_start as u32;
                         let zero = [0u32];
                         unsafe {
-                            if queue
-                                .enqueue_write_buffer(
-                                    &mut pipe.found_flag,
-                                    CL_BLOCKING,
-                                    0,
-                                    &zero,
-                                    &[],
-                                )
-                                .is_err()
-                            {
-                                return None;
-                            }
+                            queue
+                                .enqueue_write_buffer(&mut pipe.found_flag, CL_BLOCKING, 0, &zero, &[])
+                                .map_err(|e| anyhow!("opencl reset found_flag: {e:?}"))?;
                         }
                         let end_u32 = nonce_end; // hard cap respected by kernel
                         unsafe {
-                            if ExecuteKernel::new(&pipe.kernel)
+                            ExecuteKernel::new(&pipe.kernel)
                                 .set_arg(&pipe.mid_buf)
                                 .set_arg(&pipe.tail_buf)
                                 .set_arg(&pipe.target_buf)
@@ -274,10 +260,7 @@ impl MiningBackend for OpenclBackend {
                                 .set_global_work_size(global)
                                 .set_local_work_size(local_size)
                                 .enqueue_nd_range(queue)
-                                .is_err()
-                            {
-                                return None;
-                            }
+                                .map_err(|e| anyhow!("opencl kernel launch: {e:?}"))?;
                         }
                         pipe.pending_start = start_u32;
                         pipe.in_flight = true;
@@ -294,7 +277,7 @@ impl MiningBackend for OpenclBackend {
             // 3) If we couldn't launch and neither pipe is busy, the whole
             //    nonce range is exhausted.
             if !launched && !a.in_flight && !b.in_flight {
-                return None;
+                return Ok(HashOutcome::none(done(next_start)));
             }
 
             current_pipe ^= 1;
@@ -318,34 +301,37 @@ fn pick_pipe<'a>(
 }
 
 /// Wait for `pipe`'s pending launch and read out the flag/nonce/hash.
-fn drain_pipe(queue: &CommandQueue, pipe: &mut PipeRes) -> Option<MiningResult> {
-    let _ = queue.finish();
+/// Finish a launched pipe's queue and read back any solution.
+/// `Ok(Some)` = found, `Ok(None)` = launched but no solution, `Err` = a
+/// device/read fault (the caller treats repeated faults as fatal + restarts).
+fn drain_pipe(queue: &CommandQueue, pipe: &mut PipeRes) -> Result<Option<MiningResult>> {
+    queue.finish().map_err(|e| anyhow!("opencl queue finish: {e:?}"))?;
     let mut flag = [0u32; 1];
     unsafe {
         queue
             .enqueue_read_buffer(&pipe.found_flag, CL_BLOCKING, 0, &mut flag, &[])
-            .ok()?;
+            .map_err(|e| anyhow!("opencl read found_flag: {e:?}"))?;
     }
     if flag[0] == 0 {
-        return None;
+        return Ok(None);
     }
     let mut nonce_out = [0u32; 1];
     let mut hash_words = [0u32; 8];
     unsafe {
         queue
             .enqueue_read_buffer(&pipe.found_nonce, CL_BLOCKING, 0, &mut nonce_out, &[])
-            .ok()?;
+            .map_err(|e| anyhow!("opencl read found_nonce: {e:?}"))?;
         queue
             .enqueue_read_buffer(&pipe.found_hash, CL_BLOCKING, 0, &mut hash_words, &[])
-            .ok()?;
+            .map_err(|e| anyhow!("opencl read found_hash: {e:?}"))?;
     }
     let mut hash = [0u8; 32];
     for i in 0..8 {
         let be = hash_words[i].to_be_bytes();
         hash[4 * i..4 * i + 4].copy_from_slice(&be);
     }
-    Some(MiningResult {
+    Ok(Some(MiningResult {
         nonce: nonce_out[0],
         hash,
-    })
+    }))
 }

@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{HashOutcome, MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
@@ -173,6 +173,15 @@ pub fn run_stratum<B: MiningBackend>(
     let mut chunk_size: u32 = 1 << 24; // ~16.8M to start; adapts after each chunk
     let mut nonce_cursor: u32 = 0; // next nonce to sweep for the current job/xn2
 
+    // A GPU backend that errors this many times in a row is treated as fatally
+    // wedged (driver reset / XID / poisoned state): we exit `run_stratum` — and
+    // thus the process — so a supervisor (systemd Restart=always, mine-auto.sh,
+    // or the HiveOS agent) restarts the rig, instead of spinning forever mining
+    // nothing while the dashboard shows it "up". A single transient error just
+    // costs a short backoff.
+    const MAX_CONSECUTIVE_GPU_ERRORS: u32 = 3;
+    let mut consecutive_gpu_errors: u32 = 0;
+
     if cfg.cpu_threads > 0 && cfg.cpu_share > 0.0 {
         tracing::info!(
             "stratum: cpu mining enabled (threads={} share={:.2}); racing GPU per launch",
@@ -306,8 +315,10 @@ pub fn run_stratum<B: MiningBackend>(
             let cpu_swept = Arc::new(AtomicU64::new(0));
             let gpu_stop = Arc::new(AtomicBool::new(stop.load(Ordering::Relaxed)));
 
-            let gpu_result: Mutex<Option<MiningResult>> = Mutex::new(None);
-            let gpu_result_ref = &gpu_result;
+            // Carries the GPU sweep's outcome (or device error) out of the
+            // scope. Written once, by the scope's main thread.
+            let gpu_outcome: Mutex<Option<Result<HashOutcome>>> = Mutex::new(None);
+            let gpu_outcome_ref = &gpu_outcome;
 
             let midstate = midstate_of_first_chunk_fast(&hdr);
             let mut tail_template = [0u8; 20];
@@ -382,16 +393,49 @@ pub fn run_stratum<B: MiningBackend>(
                 let res = if gend > gstart {
                     backend.hash_range(hdr, target, gstart, gend, &gpu_stop)
                 } else {
-                    None
+                    Ok(HashOutcome::none(0))
                 };
-                *gpu_result_ref.lock().unwrap() = res;
+                *gpu_outcome_ref.lock().unwrap() = Some(res);
                 iter_stop.store(true, Ordering::Release);
             });
 
-            let gpu_found = gpu_result.into_inner().unwrap();
+            // Interpret the GPU outcome. An error is NOT "found nothing": count
+            // it, and if the device keeps failing, exit so a supervisor restarts
+            // the rig. Only credit hashrate for nonces the GPU ACTUALLY hashed
+            // (`nonces_done`) — never the requested range — so a dead or
+            // short-circuited card can't report a phantom rate.
+            let gpu_outcome_res = gpu_outcome
+                .into_inner()
+                .unwrap()
+                .expect("gpu sweep runs once per chunk");
+            let (gpu_found, gpu_swept): (Option<MiningResult>, u128) = match gpu_outcome_res {
+                Ok(o) => {
+                    consecutive_gpu_errors = 0;
+                    (o.result, o.nonces_done as u128)
+                }
+                Err(e) => {
+                    consecutive_gpu_errors += 1;
+                    tracing::error!(
+                        "gpu backend error ({}/{}): {:#}",
+                        consecutive_gpu_errors,
+                        MAX_CONSECUTIVE_GPU_ERRORS,
+                        e
+                    );
+                    if consecutive_gpu_errors >= MAX_CONSECUTIVE_GPU_ERRORS {
+                        bail!(
+                            "gpu backend failed {} times in a row (last error: {:#}); \
+                             exiting so the supervisor can restart the miner",
+                            consecutive_gpu_errors,
+                            e
+                        );
+                    }
+                    // Transient: brief backoff, credit no hashrate, keep the session.
+                    std::thread::sleep(Duration::from_millis(500));
+                    (None, 0)
+                }
+            };
             let cpu_found = cpu_winner.lock().unwrap().clone();
             let cpu_swept_n = cpu_swept.load(Ordering::Relaxed) as u128;
-            let gpu_swept = (gpu_range.1 as u128).saturating_sub(gpu_range.0 as u128);
             gpu_nonces_since_log = gpu_nonces_since_log.saturating_add(gpu_swept);
             cpu_nonces_since_log = cpu_nonces_since_log.saturating_add(cpu_swept_n);
 
@@ -657,11 +701,12 @@ mod tests {
             &self,
             _h: [u8; 84],
             _t: [u8; 32],
-            _s: u32,
-            _e: u32,
+            s: u32,
+            e: u32,
             _stop: &AtomicBool,
-        ) -> Option<MiningResult> {
-            None
+        ) -> Result<HashOutcome> {
+            // Swept the whole assigned range, found nothing (no GPU here).
+            Ok(HashOutcome::none(e.saturating_sub(s) as u64))
         }
     }
 
@@ -748,6 +793,8 @@ mod tests {
         let g = NullGpu;
         assert!(g
             .hash_range(hdr, easy_target, 0, 64, &AtomicBool::new(false))
+            .unwrap()
+            .result
             .is_none());
     }
 
@@ -861,5 +908,104 @@ mod tests {
             !post_handshake.contains("mining.submit"),
             "did not expect a submit in the brief hard-difficulty window, got: {post_handshake:?}"
         );
+    }
+
+    /// A backend that always faults. Used to prove the loop treats a wedged
+    /// device as fatal (exits so a supervisor restarts) rather than looping
+    /// forever mining nothing.
+    struct ErrGpu;
+    impl MiningBackend for ErrGpu {
+        fn name(&self) -> &'static str {
+            "err-gpu"
+        }
+        fn hash_range(
+            &self,
+            _h: [u8; 84],
+            _t: [u8; 32],
+            _s: u32,
+            _e: u32,
+            _stop: &AtomicBool,
+        ) -> Result<HashOutcome> {
+            anyhow::bail!("simulated device fault")
+        }
+    }
+
+    /// With a live job available, a backend that faults on every chunk must make
+    /// `run_stratum` return `Err` (after `MAX_CONSECUTIVE_GPU_ERRORS`) so the
+    /// process exits and a supervisor restarts it — NOT spin silently.
+    #[test]
+    fn run_stratum_exits_after_repeated_gpu_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut br = BufReader::new(sock.try_clone().unwrap());
+            // Read subscribe + authorize.
+            let mut req = String::new();
+            br.read_line(&mut req).unwrap();
+            req.clear();
+            br.read_line(&mut req).unwrap();
+            // Same handshake + one notify as the clean-shutdown test.
+            sock.write_all(
+                b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"aabbccdd\",4],\"error\":null}\n",
+            )
+            .unwrap();
+            sock.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n").unwrap();
+            sock.write_all(
+                b"{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[1024.0]}\n",
+            )
+            .unwrap();
+            sock.write_all(
+                b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"jobZ\",\"00000000000000000000000000000000000000000000000000000000000000ff\",\"01000000\",\"00000000\",[],\"20000000\",\"1d00ffff\",\"60c0babe\",true]}\n",
+            )
+            .unwrap();
+            sock.flush().unwrap();
+            // Keep the connection open long enough for the loop to accrue its
+            // fatal error streak (3 faults × 500ms backoff ≈ 1s).
+            std::thread::sleep(Duration::from_secs(4));
+        });
+
+        let client =
+            StratumClient::connect(&addr.to_string(), "csd1testworker").expect("connect ok");
+
+        // Wait for the pushed job so the loop has real work to fault on.
+        let mut got_job = false;
+        for _ in 0..50 {
+            if client.latest_job().is_some() {
+                got_job = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(got_job, "client should surface the pushed job");
+
+        // Watchdog: if the loop DOESN'T exit on its own (regression), stop it
+        // after 10s so the test fails on the assert below instead of hanging.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_wd = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            stop_wd.store(true, Ordering::Relaxed);
+        });
+
+        let backend = ErrGpu;
+        let cfg = MiningConfig {
+            cpu_threads: 0,
+            cpu_share: 0.0,
+        };
+        let result = run_stratum(&backend, &client, stop, cfg);
+
+        assert!(
+            result.is_err(),
+            "run_stratum must exit with Err after repeated GPU faults (got Ok — it kept spinning)"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("gpu backend failed"),
+            "exit error should explain the fatal fault streak, got: {msg:?}"
+        );
+
+        let _ = server.join();
     }
 }
