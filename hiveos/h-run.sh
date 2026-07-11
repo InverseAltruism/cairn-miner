@@ -19,6 +19,13 @@
 # Deliberately NO relay node and NO phone-home: cairn-miner ships nothing that
 # follows a remote blacklist or reports your rig anywhere.
 
+# Disable pathname globbing: Extra config args are word-split on purpose, but a
+# glob char (*, ?, [) in them must NOT expand against the miner dir and inject
+# filenames as argv (which would make clap exit 2 and crash-loop every process).
+# `set -f` is shell state and does not cross the final `exec`, so the miner is
+# unaffected. We do not rely on globbing anywhere in this script.
+set -f
+
 # Resolve our own directory whether this hook is executed OR sourced.
 SELF="${BASH_SOURCE[0]:-$0}"
 cd "$(dirname "$(readlink -f "$SELF" 2>/dev/null || echo "$SELF")")" || exit 1

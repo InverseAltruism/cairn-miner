@@ -95,6 +95,16 @@ rm -f "$STATSMARK"
 [ -f "$STATSMARK" ] && ok "sourced h-stats located the binary + ran hiveos-stats" || bad "sourced h-stats did NOT find the binary (BASH_SOURCE bug)"
 stop_all
 
+echo "== glob char in Extra args is NOT expanded against the miner dir =="
+# The miner dir contains h-*.sh; without `set -f` these would expand into argv.
+run_hrun "--worker h-*.sh"
+if grep -q -- '--worker h-\*.sh' "$INVOCATIONS"; then
+  ok "glob '*' in Extra args passed literally (no pathname expansion)"
+else
+  bad "glob in Extra args was expanded to filenames: $(grep -m1 -- '--worker' "$INVOCATIONS")"
+fi
+stop_all
+
 echo "== no duplicate flag when Extra args repeat --stats-port =="
 run_hrun "--stats-port 9999"
 dupes=$(awk '{n=gsub(/--stats-port/,"&"); if(n>1) c++} END{print c+0}' "$INVOCATIONS")

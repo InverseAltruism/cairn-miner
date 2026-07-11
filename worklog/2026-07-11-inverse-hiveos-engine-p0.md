@@ -53,7 +53,30 @@ Touch list for A+B: `src/backend.rs` (new `HashOutcome`, trait sig), `src/backen
 5. **Lowercase the address** in `hiveos/h-config.sh` (miner hard-rejects uppercase → crash-loop today).
 6. **Bump `CUSTOM_VERSION`** in `hiveos/h-manifest.conf` (stale 0.1.0) + stamp it from the tag in CI.
 
-## STATUS: implemented + tested on branch (4 commits), NOT pushed. Adversarial review in progress.
+## STATUS: implemented + reviewed + remediated on branch (6 commits), NOT pushed.
+
+Two adversarial code reviews were run against the diff:
+1. **Full 3-dimension review** (engine / shell / packaging, each verified) → 19 real findings.
+   All fixed in `840d8d7` (P1 sourced-$0 khs=0, P1 unbounded per-GPU log + no supervisor backoff,
+   P1/P2 HiveOS should ship the CUDA binary not opencl-linked, P2 CpuBackend u32::MAX hang, P2
+   EXTRA-only-on-device-0 + double-flag crash, P2 pidfile pre-kill, P2 version-stamp regex/sed,
+   P3s: opencl swallowed fault, nvidia-smi-only gpu count, --help timeout, h-stop over-match,
+   writable-log fallback, glibc note, version bump; nits: chunk-tuner timing, empty-wallet warning).
+2. **Focused re-review of the remediation** (2 agents, Rust + shell) → Rust changes proven correct
+   (traced the `end - n` underflow invariant + hand-verified test counts); shell proven sound
+   (fork-capture + brick-safety + stop-ordering), found ONE real latent bug: unquoted $EXTRA glob
+   expansion → fixed with `set -f` in `abc` (final commit) + a regression test.
+
+DECISION LOG (deliberate scope choices, not oversights):
+- HiveOS ships the **CUDA** binary (NVIDIA majority; cudarc dlopen's the driver, no hard lib dep).
+  An opencl-linked binary carries a hard libOpenCL DT_NEEDED and won't start on rigs lacking the ICD
+  loader. AMD HiveOS multi-GPU therefore needs one flight-sheet slot per card for now (documented).
+- Standalone `cairn-miner-linux-opencl-x86_64` asset still built with the runner glibc (pre-existing,
+  separate download, out of scope for this branch).
+- set_extranonce, GPU auto-tune, OpenCL persistent pipeline, launcher worker auto-restart, address
+  normalization across installers, TLS → deferred to a follow-up branch (see MINER-DEEP-DIVE report).
+
+## SUPERSEDED plan (implemented above)
 
 Commits (on `fix/hiveos-and-engine-reliability`, base 1a9698d):
 - `48cbeee` fix(engine): surface GPU faults + honest hashrate (P0)
