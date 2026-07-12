@@ -119,6 +119,27 @@ struct CpuFind {
     hash: [u8; 32],
 }
 
+/// Should the GPU-hang watchdog kill the process? True only when ALL of:
+/// a launch is in flight (`armed` — set strictly around `hash_range`, so it
+/// also implies a job is active), the pool link is up (`connected` — a mid-
+/// outage rig gets no false restart), and the in-flight launch has made no
+/// progress for at least `limit`. Kept pure so the gating is unit-testable
+/// without a 120s stall.
+#[inline]
+fn watchdog_should_fire(armed: bool, connected: bool, stalled_for: Duration, limit: Duration) -> bool {
+    armed && connected && stalled_for >= limit
+}
+
+/// RAII flag: dropped on ANY exit path out of `run_stratum` (clean stop or
+/// `bail!`), telling the watchdog thread to wind down instead of outliving
+/// the loop.
+struct WatchdogStopGuard(Arc<AtomicBool>);
+impl Drop for WatchdogStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Run the pooled Stratum mining loop until `stop` is set.
 ///
 /// `client` must already be connected (handshake done, reader thread running).
@@ -181,6 +202,57 @@ pub fn run_stratum<B: MiningBackend>(
     // costs a short backoff.
     const MAX_CONSECUTIVE_GPU_ERRORS: u32 = 3;
     let mut consecutive_gpu_errors: u32 = 0;
+
+    // GPU-hang watchdog. The consecutive-error exit above only helps when
+    // `hash_range` RETURNS an error; a wedged driver call (cuStreamSynchronize
+    // / clFinish after an XID or bus reset) blocks forever, leaving a process
+    // that looks alive but mines nothing and that no in-process check can
+    // reach. So: the mining thread beats a heartbeat strictly around every
+    // `hash_range` call, and a monitor thread exits the process (code 2, so a
+    // supervisor restarts it) when an ARMED beat goes stale for WATCHDOG_STALL
+    // while the pool link is up. 120s is orders of magnitude above any healthy
+    // launch (chunks auto-tune toward ~400ms), so false positives need a
+    // genuinely wedged device. CPU backends skip the watchdog entirely —
+    // there's no driver call to wedge.
+    const WATCHDOG_STALL: Duration = Duration::from_secs(120);
+    let watchdog_epoch = Instant::now();
+    let hb_beat_ms = Arc::new(AtomicU64::new(0)); // ms since watchdog_epoch of the last beat
+    let hb_armed = Arc::new(AtomicBool::new(false)); // true only inside hash_range
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let _watchdog_guard = WatchdogStopGuard(Arc::clone(&watchdog_done));
+    if backend.name() != "cpu" {
+        let beat = Arc::clone(&hb_beat_ms);
+        let armed = Arc::clone(&hb_armed);
+        let done = Arc::clone(&watchdog_done);
+        let stats_w = Arc::clone(&stats);
+        let backend_name = backend.name();
+        std::thread::Builder::new()
+            .name("gpu-watchdog".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                let stalled_for = Duration::from_millis(
+                    (watchdog_epoch.elapsed().as_millis() as u64)
+                        .saturating_sub(beat.load(Ordering::Relaxed)),
+                );
+                if watchdog_should_fire(
+                    armed.load(Ordering::Relaxed),
+                    stats_w.snapshot().connected,
+                    stalled_for,
+                    WATCHDOG_STALL,
+                ) {
+                    tracing::error!(
+                        "gpu watchdog: {backend_name} hash_range made no progress for {}s \
+                         (wedged driver call?); exiting so the supervisor restarts the miner",
+                        stalled_for.as_secs(),
+                    );
+                    std::process::exit(2);
+                }
+            })
+            .expect("spawning gpu watchdog thread");
+    }
 
     if cfg.cpu_threads > 0 && cfg.cpu_share > 0.0 {
         tracing::info!(
@@ -391,9 +463,20 @@ pub fn run_stratum<B: MiningBackend>(
                 });
 
                 // GPU sweep on its assigned sub-range (main scope thread).
+                // The heartbeat is armed strictly around the backend call so a
+                // driver call that never returns leaves an armed, stale beat
+                // for the watchdog to catch; idle time between launches
+                // (waiting for jobs, reconnects) can never trip it.
                 let (gstart, gend) = gpu_range;
                 let res = if gend > gstart {
-                    backend.hash_range(hdr, target, gstart, gend, &gpu_stop)
+                    hb_beat_ms.store(
+                        watchdog_epoch.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                    hb_armed.store(true, Ordering::Relaxed);
+                    let r = backend.hash_range(hdr, target, gstart, gend, &gpu_stop);
+                    hb_armed.store(false, Ordering::Relaxed);
+                    r
                 } else {
                     Ok(HashOutcome::none(0))
                 };
@@ -677,6 +760,23 @@ mod tests {
         // Divide by a larger-than-value divisor → floor 0.
         let zero = u256_div_u64_be(&two, 5);
         assert_eq!(zero, [0u8; 32]);
+    }
+
+    // --- GPU-hang watchdog gating ---
+
+    #[test]
+    fn watchdog_fires_only_when_armed_connected_and_stalled() {
+        let limit = Duration::from_secs(120);
+        let stalled = Duration::from_secs(121);
+        let fresh = Duration::from_secs(3);
+        // The one lethal combination: launch in flight + pool up + stale beat.
+        assert!(watchdog_should_fire(true, true, stalled, limit));
+        // Every safety gate individually blocks the kill:
+        assert!(!watchdog_should_fire(false, true, stalled, limit)); // no launch in flight
+        assert!(!watchdog_should_fire(true, false, stalled, limit)); // pool link down
+        assert!(!watchdog_should_fire(true, true, fresh, limit)); // healthy progress
+        // Boundary: exactly at the limit fires (>=, not >).
+        assert!(watchdog_should_fire(true, true, limit, limit));
     }
 
     // --- xn2-only rolling: composing the extranonce keeps xn1 fixed ---
