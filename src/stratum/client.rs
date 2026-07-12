@@ -4,7 +4,8 @@
 //!
 //! This is the **protocol/transport** layer only. The reader thread parses
 //! `mining.notify` into a [`StratumJob`] (the raw 9-tuple + the session
-//! extranonce1) and stashes `mining.set_difficulty` — it does NOT build a
+//! extranonce1) and stashes `mining.set_difficulty` /
+//! `mining.set_extranonce` — it does NOT build a
 //! [`crate::csd_consensus::WorkTemplate`]; the mapping step does that.
 //!
 //! Concurrency model:
@@ -522,9 +523,10 @@ impl Drop for StratumClient {
 }
 
 /// Parse one received line and update [`Shared`] accordingly. Recognizes the
-/// two server pushes we care about (`mining.notify`, `mining.set_difficulty`)
-/// and silently ignores everything else (submit acks, keep-alives, blank lines,
-/// unparseable junk) — a malformed push must never take the reader down.
+/// three server pushes we care about (`mining.notify`, `mining.set_difficulty`,
+/// `mining.set_extranonce`) and silently ignores everything else (submit acks,
+/// keep-alives, blank lines, unparseable junk) — a malformed push must never
+/// take the reader down.
 ///
 /// Kept as a free function taking `&Shared` so it is unit-testable without a
 /// socket: feed it a canned line and assert the resulting state.
@@ -604,8 +606,47 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                 ),
             }
         }
-        // mining.set_extranonce, client.reconnect, etc. are not handled here
-        // (out of scope for Task 2); ignore them.
+        // Session re-key: `[extranonce1_hex, extranonce2_size]`. Our pool never
+        // sends this mid-session, but Stratum proxies do when they re-key a
+        // downstream connection — dropping it would make every share we build
+        // from the stale xn1 invalid until the next reconnect.
+        "mining.set_extranonce" => {
+            let arr = note.params.as_array();
+            let xn1 = arr
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && hex::decode(s).is_ok());
+            match xn1 {
+                Some(xn1) => {
+                    // Second param (xn2 byte width) is optional on the wire;
+                    // keep the subscribe-time size when absent or non-numeric.
+                    let xn2_size = arr.and_then(|a| a.get(1)).and_then(|v| v.as_u64());
+                    if let Ok(mut g) = shared.extranonce1_hex.lock() {
+                        *g = xn1.to_string();
+                    }
+                    if let Some(sz) = xn2_size {
+                        shared.extranonce2_size.store(sz, Ordering::Relaxed);
+                    }
+                    // Re-key the stored job too: the mining loop compares the
+                    // job's extranonce1 against its own and rebuilds the
+                    // coinbase bases on mismatch (same path as a job change).
+                    if let Ok(mut slot) = shared.latest_job.lock() {
+                        if let Some(job) = slot.as_mut() {
+                            job.extranonce1_hex = xn1.to_string();
+                        }
+                    }
+                    tracing::info!(
+                        "stratum: set_extranonce xn1={xn1} xn2_size={}",
+                        xn2_size.map_or_else(|| "(kept)".into(), |s| s.to_string()),
+                    );
+                }
+                None => tracing::warn!(
+                    "stratum: bad mining.set_extranonce params, ignoring: {}",
+                    note.params
+                ),
+            }
+        }
+        // client.reconnect, client.show_message, etc.: ignore.
         _ => {}
     }
 }
@@ -776,11 +817,63 @@ mod tests {
         dispatch_frame("not json at all", &shared);
         dispatch_frame(r#"{"id":7,"result":true,"error":null}"#, &shared); // submit ack
         dispatch_frame(
-            r#"{"id":null,"method":"mining.set_extranonce","params":["ab",4]}"#,
+            r#"{"id":null,"method":"client.show_message","params":["hi"]}"#,
             &shared,
         );
         assert!(shared.latest_job.lock().unwrap().is_none());
         assert_eq!(shared.difficulty(), 1.0);
+    }
+
+    #[test]
+    fn dispatch_set_extranonce_rekeys_session_and_pending_job() {
+        let shared = fresh_shared("cafef00d", 4);
+        // Seed a job so we can verify it gets re-keyed in place.
+        dispatch_frame(
+            r#"{"id":null,"method":"mining.notify","params":["j1","00ff","aa","bb",["cc"],"01000000","1d00ffff","60c0babe",true]}"#,
+            &shared,
+        );
+        dispatch_frame(
+            r#"{"id":null,"method":"mining.set_extranonce","params":["ab12cd34",8]}"#,
+            &shared,
+        );
+        // Session xn1 + xn2 size updated…
+        assert_eq!(shared.extranonce1_hex.lock().unwrap().clone(), "ab12cd34");
+        assert_eq!(shared.extranonce2_size.load(Ordering::Relaxed), 8);
+        // …and the stored job carries the new xn1 so the mining loop rebuilds
+        // its coinbase bases (job-change path) instead of mining stale work.
+        let job = shared.latest_job.lock().unwrap().clone().unwrap();
+        assert_eq!(job.extranonce1_hex, "ab12cd34");
+        assert_eq!(job.notify.job_id, "j1");
+    }
+
+    #[test]
+    fn dispatch_set_extranonce_without_size_keeps_current_size() {
+        let shared = fresh_shared("cafef00d", 4);
+        // Single-param form (some proxies omit the size): xn1 updates, size kept.
+        dispatch_frame(
+            r#"{"id":null,"method":"mining.set_extranonce","params":["deadbeef"]}"#,
+            &shared,
+        );
+        assert_eq!(shared.extranonce1_hex.lock().unwrap().clone(), "deadbeef");
+        assert_eq!(shared.extranonce2_size.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn dispatch_set_extranonce_rejects_bad_params() {
+        let shared = fresh_shared("cafef00d", 4);
+        // Non-hex, empty, wrong-typed and missing params must all be ignored
+        // (never clobber the session xn1 with garbage).
+        for line in [
+            r#"{"id":null,"method":"mining.set_extranonce","params":["not-hex",4]}"#,
+            r#"{"id":null,"method":"mining.set_extranonce","params":["",4]}"#,
+            r#"{"id":null,"method":"mining.set_extranonce","params":[42,4]}"#,
+            r#"{"id":null,"method":"mining.set_extranonce","params":[]}"#,
+            r#"{"id":null,"method":"mining.set_extranonce","params":{}}"#,
+        ] {
+            dispatch_frame(line, &shared);
+        }
+        assert_eq!(shared.extranonce1_hex.lock().unwrap().clone(), "cafef00d");
+        assert_eq!(shared.extranonce2_size.load(Ordering::Relaxed), 4);
     }
 
     #[test]

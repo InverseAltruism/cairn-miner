@@ -264,9 +264,11 @@ pub fn run_stratum<B: MiningBackend>(
                 break; // re-poll latest_job (may be the same; may be newer)
             }
             // If the pool pushed a new job, abandon this one immediately so we
-            // never mine stale work past a clean_jobs boundary.
+            // never mine stale work past a clean_jobs boundary. A changed
+            // extranonce1 (mining.set_extranonce re-key) invalidates the
+            // coinbase bases the same way, so it takes the same exit.
             if let Some(j) = client.latest_job() {
-                if j.notify.job_id != mapped.job_id {
+                if j.notify.job_id != mapped.job_id || j.extranonce1_hex != job.extranonce1_hex {
                     break;
                 }
             }
