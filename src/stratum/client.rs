@@ -44,6 +44,25 @@ const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// A handshake-level authorization rejection: the pool answered our
+/// `mining.authorize` and said no. Typed (rather than a bare `anyhow!`) so the
+/// reconnect loop can tell it apart from transport failures — a bad payout
+/// address never fixes itself, so hammering/rotating forever is wrong there,
+/// while a dead pool very much wants the retry loop.
+#[derive(Debug)]
+struct AuthRejected {
+    worker: String,
+    detail: String,
+}
+
+impl std::fmt::Display for AuthRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pool rejected authorization for {}{}", self.worker, self.detail)
+    }
+}
+
+impl std::error::Error for AuthRejected {}
+
 /// A job pushed by the pool via `mining.notify`, paired with the session
 /// `extranonce1` captured at subscribe time. The notify→header mapping is
 /// Task 3; this is the raw material that mapping will consume.
@@ -334,7 +353,13 @@ impl StratumClient {
                 Some(2) => {
                     if let Some(err) = &resp.error {
                         if !err.is_null() {
-                            return Err(anyhow!("mining.authorize rejected: {err}"));
+                            // The pool answered and refused — handshake-level
+                            // rejection, not a transport error.
+                            return Err(AuthRejected {
+                                worker: worker_addr.to_string(),
+                                detail: format!(": {err}"),
+                            }
+                            .into());
                         }
                     }
                     authorized = Some(resp.result.as_bool().unwrap_or(false));
@@ -348,9 +373,11 @@ impl StratumClient {
 
         let subscribe = subscribe.expect("loop exits only once Some");
         if authorized != Some(true) {
-            return Err(anyhow!(
-                "mining.authorize returned false for worker {worker_addr}"
-            ));
+            return Err(AuthRejected {
+                worker: worker_addr.to_string(),
+                detail: " (mining.authorize returned false)".to_string(),
+            }
+            .into());
         }
 
         Ok(Handshake {
@@ -656,6 +683,16 @@ fn dispatch_frame(line: &str, shared: &Shared) {
 /// brief restart before we give up on it.
 const ENDPOINT_TRIES_BEFORE_ROTATE: u32 = 2;
 
+/// How many consecutive authorize rejections before the process exits. A pool
+/// that answers and says "no" three times in a row means the payout address is
+/// wrong — retrying forever just hammers the pool while the operator sees a
+/// rig that looks merely "reconnecting".
+const MAX_CONSECUTIVE_AUTH_REJECTS: u32 = 3;
+
+/// Distinct exit code for "the pool rejected our worker address" so
+/// supervisors/operators can tell it apart from a generic crash.
+const EXIT_CODE_AUTH_REJECTED: i32 = 3;
+
 /// Reconnect with capped exponential backoff and jitter: sleep, re-run the
 /// handshake, and on success swap in the fresh write half + reader stream and
 /// refresh the session extranonce1/size. Returns `false` iff shutdown was
@@ -663,8 +700,18 @@ const ENDPOINT_TRIES_BEFORE_ROTATE: u32 = 2;
 ///
 /// **Endpoint rotation**: after [`ENDPOINT_TRIES_BEFORE_ROTATE`] consecutive
 /// failures on the current endpoint the function advances `endpoint_idx`
-/// round-robin to the next one in `endpoints`. A successful connect resets the
-/// index to 0 (primary) and resets the backoff.
+/// round-robin to the next one in `endpoints`. Rotation deliberately does NOT
+/// reset the backoff — only a SUCCESSFUL connect does — so when every endpoint
+/// is down the sleep keeps climbing toward [`BACKOFF_MAX`] across rotation
+/// cycles instead of hammering the whole list at [`BACKOFF_MIN`] forever.
+/// A successful connect resets the index to 0 (primary) and the backoff.
+///
+/// **Auth rejection**: a handshake that fails with [`AuthRejected`] (the pool
+/// answered `mining.authorize` with an error/false — NOT a transport failure)
+/// is loudly logged, and after [`MAX_CONSECUTIVE_AUTH_REJECTS`] in a row the
+/// process exits with [`EXIT_CODE_AUTH_REJECTED`]: a wrong payout address
+/// never fixes itself, so restart-loop visibility beats silent hammering. Any
+/// transport failure resets that counter.
 ///
 /// **Jitter**: each backoff sleep is multiplied by a random factor in
 /// `0.5..1.5` drawn from `rand::thread_rng()`. This breaks the thundering-herd
@@ -689,6 +736,9 @@ fn reconnect(
 
     // Consecutive failures against the current endpoint; triggers rotation.
     let mut tries_on_current: u32 = 0;
+    // Consecutive handshake-level authorize rejections (across endpoints);
+    // reset by any transport failure or success. See MAX_CONSECUTIVE_AUTH_REJECTS.
+    let mut consecutive_auth_rejects: u32 = 0;
 
     loop {
         if shared.shutdown.load(Ordering::Relaxed) {
@@ -743,30 +793,53 @@ fn reconnect(
                 return true;
             }
             Err(e) => {
-                tracing::warn!("stratum: reconnect to {endpoint} failed: {e}");
+                if e.downcast_ref::<AuthRejected>().is_some() {
+                    // The pool is alive and said NO. Loud + actionable: this is
+                    // almost always a typo'd/uppercase payout address, and no
+                    // amount of retrying fixes it.
+                    consecutive_auth_rejects += 1;
+                    tracing::error!(
+                        "stratum: {e:#} ({consecutive_auth_rejects}/{MAX_CONSECUTIVE_AUTH_REJECTS}) \
+                         — check your payout address"
+                    );
+                    if consecutive_auth_rejects >= MAX_CONSECUTIVE_AUTH_REJECTS {
+                        tracing::error!(
+                            "stratum: pool rejected worker {worker_addr} \
+                             {MAX_CONSECUTIVE_AUTH_REJECTS} times in a row — the payout \
+                             address is almost certainly wrong; exiting (code \
+                             {EXIT_CODE_AUTH_REJECTED}) instead of hammering the pool"
+                        );
+                        std::process::exit(EXIT_CODE_AUTH_REJECTED);
+                    }
+                } else {
+                    // Transport failure (dead pool, DNS, timeout): says nothing
+                    // about the address, so the auth-reject streak resets.
+                    consecutive_auth_rejects = 0;
+                    tracing::warn!("stratum: reconnect to {endpoint} failed: {e}");
+                }
                 tries_on_current += 1;
 
                 // After a couple of failures, rotate to the next endpoint so a
-                // dead pool doesn't block us from the backup indefinitely.
+                // dead pool doesn't block us from the backup indefinitely. The
+                // backoff is NOT reset here (only a successful connect resets
+                // it): with every endpoint down, a reset per rotation kept the
+                // loop hammering the whole list at BACKOFF_MIN forever.
                 if tries_on_current >= ENDPOINT_TRIES_BEFORE_ROTATE && endpoints.len() > 1 {
                     let next = (idx + 1) % endpoints.len();
                     endpoint_idx.store(next, Ordering::Relaxed);
                     tries_on_current = 0;
-                    // Reset backoff when switching endpoints so we try the new
-                    // one promptly rather than sleeping the full doubled delay.
-                    *backoff = BACKOFF_MIN;
                     tracing::info!(
                         "stratum: rotating to next endpoint {} ({}/{})",
                         endpoints[next],
                         next + 1,
                         endpoints.len(),
                     );
-                    continue; // skip the backoff bump below; we just reset it
                 }
             }
         }
 
-        // Bump backoff, capped (only reached on failure without rotation).
+        // Bump backoff, capped — on every failed attempt, rotation included, so
+        // a fully-dark endpoint list climbs toward BACKOFF_MAX.
         *backoff = (*backoff * 2).min(BACKOFF_MAX);
     }
 }
@@ -891,6 +964,66 @@ mod tests {
         );
         let job = shared.latest_job.lock().unwrap().clone().unwrap();
         assert_eq!(job.notify.job_id, "good");
+    }
+
+    /// Drive one `handshake()` against a fake bridge that replies to subscribe
+    /// normally and answers the authorize (id=2) with `reply`. Returns the
+    /// handshake error for classification asserts.
+    fn handshake_err_with_authorize_reply(reply: &'static [u8]) -> anyhow::Error {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut br = BufReader::new(sock.try_clone().unwrap());
+            let mut line = String::new();
+            br.read_line(&mut line).unwrap(); // subscribe
+            line.clear();
+            br.read_line(&mut line).unwrap(); // authorize
+            sock.write_all(
+                b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"abcd1234\",4],\"error\":null}\n",
+            )
+            .unwrap();
+            sock.write_all(reply).unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let err = match StratumClient::handshake(&addr.to_string(), "csd1badaddr") {
+            Ok(_) => panic!("handshake must fail on an authorize rejection"),
+            Err(e) => e,
+        };
+        let _ = server.join();
+        err
+    }
+
+    #[test]
+    fn authorize_false_and_error_classify_as_auth_rejected() {
+        // Both rejection shapes — result:false and an error triple — must
+        // surface as the typed AuthRejected so the reconnect loop can go fatal
+        // instead of hammering the pool forever.
+        for reply in [
+            b"{\"id\":2,\"result\":false,\"error\":null}\n".as_slice(),
+            b"{\"id\":2,\"result\":null,\"error\":[24,\"Invalid worker address\",null]}\n".as_slice(),
+        ] {
+            let err = handshake_err_with_authorize_reply(reply);
+            assert!(
+                err.downcast_ref::<AuthRejected>().is_some(),
+                "expected AuthRejected, got: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_failure_is_not_classified_as_auth_rejected() {
+        // Connect to a port that just closed: a pure transport failure must
+        // NOT count toward the fatal auth-reject streak.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // port now refuses connections
+        let err = match StratumClient::handshake(&addr.to_string(), "csd1worker") {
+            Ok(_) => panic!("connect to a closed port must fail"),
+            Err(e) => e,
+        };
+        assert!(err.downcast_ref::<AuthRejected>().is_none());
     }
 
     /// End-to-end-ish smoke test against a localhost listener that plays the
