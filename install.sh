@@ -51,17 +51,7 @@ die(){ printf '\033[38;2;255;107;107m[x] %s\033[0m\n' "$*" >&2; exit 1; }
 grn "  === cairn-miner installer (Linux) ==="
 say
 
-# --- 1. address ------------------------------------------------------------
-ADDR="${CAIRN_ADDR:-}"
-[ -z "$ADDR" ] && ADDR="$(grep -oE '^address *= *"[0-9a-fx]+"' "$CFG" 2>/dev/null | grep -oE '[0-9a-fx]{40,42}' | head -1 || true)"
-if [ -z "$ADDR" ] && [ -t 0 ]; then
-  read -rp "  your CSD payout address (addr20, 40 hex): " ADDR
-fi
-ADDR="${ADDR#0x}"
-[ -z "$ADDR" ] && die "no payout address. Re-run with:  curl ... | CAIRN_ADDR=<addr20> bash    (or create one: cairn-miner newwallet)"
-printf '%s' "$ADDR" | grep -Eq '^[0-9a-f]{40}$' || die "address must be 40 lowercase hex chars (got: $ADDR)"
-
-# --- 2. backend detection --------------------------------------------------
+# --- 1. backend detection --------------------------------------------------
 if [ -z "$VARIANT" ]; then
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
     VARIANT="cuda"
@@ -73,11 +63,12 @@ if [ -z "$VARIANT" ]; then
   fi
 fi
 say "  backend:   $VARIANT"
-say "  address:   $ADDR"
 say "  pool:      ${CAIRN_POOL:-$DEFAULT_POOL}"
 say
 
-# --- 3. obtain the binary: prebuilt release, else build from source --------
+# --- 2. obtain the binary: prebuilt release, else build from source --------
+# Done BEFORE the address check so the "create one: cairn-miner newwallet"
+# instruction below actually works — the binary exists by the time we print it.
 ARCH="$(uname -m)"
 ASSET="cairn-miner-linux-${VARIANT}-${ARCH}"
 download(){ # url out
@@ -102,13 +93,27 @@ else
   grn "  [ok] built cairn-miner ($VARIANT) from source"
 fi
 
+# --- 3. address ------------------------------------------------------------
+ADDR="${CAIRN_ADDR:-}"
+[ -z "$ADDR" ] && ADDR="$(grep -oE '^address *= *"[0-9a-fx]+"' "$CFG" 2>/dev/null | grep -oE '[0-9a-fx]{40,42}' | head -1 || true)"
+if [ -z "$ADDR" ] && [ -t 0 ]; then
+  read -rp "  your CSD payout address (addr20, 40 hex): " ADDR
+fi
+ADDR="${ADDR#0x}"
+# The miner hard-rejects uppercase hex (crash-loop); normalize like h-config.sh.
+ADDR="${ADDR,,}"
+[ -z "$ADDR" ] && die "no payout address. Create one now:  $BIN newwallet    then re-run with:  curl ... | CAIRN_ADDR=<addr20> bash"
+printf '%s' "$ADDR" | grep -Eq '^[0-9a-f]{40}$' || die "address must be 40 hex chars (got: $ADDR)"
+say "  address:   $ADDR"
+say
+
 # --- 4. write config -------------------------------------------------------
 {
   echo "# cairn-miner config (written by install.sh)"
   echo "address = \"$ADDR\""
   [ -n "${CAIRN_POOL:-}" ] && echo "pool = \"$CAIRN_POOL\""
   [ -n "${CAIRN_WORKER:-}" ] && echo "worker = \"$CAIRN_WORKER\""
-  echo "backend = \"${VARIANT/cuda/cuda}\""
+  echo "backend = \"$VARIANT\""
   echo "cpu_threads = 0   # GPU-only by default; raise on a desktop with thermal headroom"
 } > "$CFG"
 say "  config:    $CFG"

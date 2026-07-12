@@ -35,7 +35,11 @@ if (-not $Address -and (Test-Path $cfg)) {
 }
 if (-not $Address) { $Address = Read-Host "  your CSD payout address (addr20, 40 hex)" }
 $Address = $Address -replace '^0x',''
-if ($Address -notmatch '^[0-9a-f]{40}$') { Die "address must be 40 lowercase hex chars (create one: cairn-miner.exe newwallet)" }
+# The miner hard-rejects uppercase hex (crash-loop), and PowerShell -match is
+# case-INSENSITIVE so uppercase would slip through the check below. Normalize
+# first, exactly like hiveos/h-config.sh does.
+$Address = $Address.ToLower()
+if ($Address -notmatch '^[0-9a-f]{40}$') { Die "address must be 40 hex chars (create one: cairn-miner.exe newwallet)" }
 
 # 2. backend
 if (-not $Backend -or $Backend -eq "auto") {
