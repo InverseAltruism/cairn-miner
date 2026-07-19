@@ -291,6 +291,16 @@ impl MiningBackend for CudaBackend {
                     None
                 }
             };
+            // Range guard (the real fix): NEVER return a nonce outside the range
+            // we were asked to scan. A device found_flag/found_nonce can survive a
+            // launch under a stream-timing race and be drained as a stale "find"
+            // from an EARLIER, lower chunk — the caller sweeps monotonically, so a
+            // stale nonce is always < nonce_start here. Discarding out-of-range
+            // results makes hash_range's contract hold unconditionally, which the
+            // in_flight reset above only mostly guaranteed. This is what actually
+            // kills the low-difficulty duplicate-share reject.
+            let drain_result = drain_result
+                .filter(|res| res.nonce >= nonce_start && res.nonce < nonce_end);
             if let Some(res) = drain_result {
                 // Drain the sibling too so its abandoned in-flight launch can't
                 // leak into the next call either. Do NOT `?` here: we already
