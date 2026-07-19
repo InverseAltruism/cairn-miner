@@ -400,6 +400,26 @@ fn main() {
     }
 }
 
+/// Run a GPU-backend init closure under `catch_unwind` with the default panic
+/// hook temporarily silenced. cudarc / some OpenCL ICDs *panic* (not just return
+/// Err) on a driver/context/version fault during init. The panic is expected and
+/// caught here so `auto` can fall through (or a forced backend can bail cleanly),
+/// but the default hook would still dump a `thread 'main' panicked ... note: run
+/// with RUST_BACKTRACE=1` to stderr first - which reads like a crash in HiveOS /
+/// systemd logs even though the miner recovered. Swallow that output; the caller
+/// still surfaces the failure as a tracing::warn/error.
+///
+/// Safe because backend probing happens single-threaded, before any worker
+/// threads are spawned (the panic hook is process-global).
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+fn init_backend_quietly<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| { /* expected init panic; caller logs it */ }));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(prev);
+    r
+}
+
 fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -553,7 +573,7 @@ fn run() -> Result<()> {
                 "backend=opencl (forced) blocks={} tpb={} npt={} - trying init...",
                 cli.blocks, cli.threads_per_block, cli.nonces_per_thread,
             );
-            let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let init = init_backend_quietly((|| {
                 OpenclBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
             }));
             let b = match init {
@@ -583,7 +603,7 @@ fn run() -> Result<()> {
             // cudarc can panic (not just return Err) on a low-level driver/context
             // error during init; catch it so we exit with a clear message instead
             // of an unwinding backtrace.
-            let init = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let init = init_backend_quietly((|| {
                 CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
             }));
             let b = match init {
@@ -618,7 +638,7 @@ fn run() -> Result<()> {
                 // cudarc can panic (rather than return Err) on a low-level driver
                 // or context error during init. Catch the panic so `auto` can fall
                 // through to OpenCL instead of crashing.
-                let cuda_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let cuda_result = init_backend_quietly((|| {
                     CudaBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
                 }));
                 match cuda_result {
@@ -663,7 +683,7 @@ fn run() -> Result<()> {
                 // enumeration or context creation. Catch the panic so `auto`
                 // falls through to CPU instead of aborting. Mirrors the CUDA
                 // sibling above and the forced `--backend opencl` path.
-                let opencl_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let opencl_result = init_backend_quietly((|| {
                     OpenclBackend::new(cli.device, cli.blocks, cli.threads_per_block, cli.nonces_per_thread)
                 }));
                 match opencl_result {
