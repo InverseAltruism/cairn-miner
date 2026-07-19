@@ -164,6 +164,23 @@ enum Cmd {
         json: bool,
     },
 
+    /// Aggregate the per-GPU workers' loopback stats endpoints into the one
+    /// JSON line the HiveOS `h-stats.sh` hook consumes, then exit. Scrapes
+    /// `http://127.0.0.1:<stats-port + i>/stats` for each GPU slot and prints
+    /// `{"khs":…,"stats":{…}}`. Always prints a valid object (alive-zero if no
+    /// worker answers) so a HiveOS rig never reads "crashed".
+    HiveosStats {
+        /// Base loopback stats port. Per-GPU workers listen on
+        /// `stats-port, stats-port+1, …` (see the HiveOS `h-run.sh` hook).
+        #[arg(long, default_value_t = 3380)]
+        stats_port: u16,
+
+        /// Number of GPU worker slots to scrape (`base..base+N`). If omitted,
+        /// auto-probes contiguous ports up from `stats-port`.
+        #[arg(long)]
+        gpus: Option<usize>,
+    },
+
     /// Cross-check every available backend against the canonical CPU
     /// sha256d on randomized inputs. Exits 0 if all backends agree, 1
     /// on any mismatch.
@@ -405,6 +422,12 @@ fn run() -> Result<()> {
 
     if let Some(Cmd::Devices { json }) = cli.cmd {
         return print_devices(json);
+    }
+
+    if let Some(Cmd::HiveosStats { stats_port, gpus }) = cli.cmd {
+        // No network to the pool, no address needed: just scrape the local
+        // per-GPU stats ports and print the HiveOS JSON.
+        return cairn_miner::hiveos::run(stats_port, gpus);
     }
 
     if let Some(Cmd::Bench { nonces }) = cli.cmd {

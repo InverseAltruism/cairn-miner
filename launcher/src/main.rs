@@ -307,8 +307,10 @@ impl LauncherApp {
             while self.hashrate_history.len() > HISTORY_LEN {
                 self.hashrate_history.pop_front();
             }
-            if self.agg.workers_alive == 0 {
-                self.status = "⚠ all workers exited — see Logs".into();
+            if self.rows.iter().any(|r| r.gave_up) {
+                self.status = "⚠ a worker is failing repeatedly — check Logs".into();
+            } else if self.agg.workers_alive == 0 {
+                self.status = "⚠ all workers exited — restarting automatically (see Logs)".into();
             }
         }
     }
@@ -451,6 +453,13 @@ impl LauncherApp {
                         };
                         ui.label(RichText::new("●").color(dot).size(10.0));
                         ui.label(RichText::new(&r.label).color(theme::FG).size(12.0));
+                        if r.gave_up {
+                            ui.label(
+                                RichText::new("failing repeatedly — check Logs")
+                                    .color(theme::RED)
+                                    .size(11.0),
+                            );
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new(theme::format_hashrate(r.hashrate_hps))
@@ -463,6 +472,13 @@ impl LauncherApp {
                                     .color(theme::DIM)
                                     .size(11.0),
                             );
+                            if r.restarts > 0 {
+                                ui.label(
+                                    RichText::new(format!("↻ {}", r.restarts))
+                                        .color(theme::AMBER)
+                                        .size(11.0),
+                                );
+                            }
                         });
                     });
                 }

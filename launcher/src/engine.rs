@@ -12,8 +12,28 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 use crate::stats::{self, StatsSnapshot};
+
+/// First respawn delay after a worker dies; doubles per consecutive failure.
+const RESTART_BACKOFF_START: Duration = Duration::from_secs(2);
+/// Ceiling for the respawn backoff.
+const RESTART_BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// A worker that stays alive this long earns a fresh failure streak — a crash
+/// after hours of mining is a new incident, not strike N of the old one.
+const RESTART_STABLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Consecutive failures after which the engine stops respawning a worker and
+/// flags it in the UI instead (something is structurally wrong — bad driver,
+/// missing DLL, dead card — and a restart loop would just burn cycles).
+const RESTART_MAX_CONSECUTIVE_FAILS: u32 = 20;
+
+/// Respawn delay for the `n`-th consecutive failure (1-based): 2s doubling,
+/// capped at [`RESTART_BACKOFF_CAP`].
+fn restart_backoff(consecutive_fails: u32) -> Duration {
+    let exp = consecutive_fails.saturating_sub(1).min(6); // 2s * 2^6 already exceeds the cap
+    (RESTART_BACKOFF_START * 2u32.saturating_pow(exp)).min(RESTART_BACKOFF_CAP)
+}
 
 /// What a worker mines. Fields beyond `index` are carried for completeness /
 /// future per-worker detail even though the compact label already encodes them.
@@ -52,6 +72,40 @@ struct Worker {
     log_path: PathBuf,
     last: Option<StatsSnapshot>,
     alive: bool,
+    /// Respawn material: the miner exe + the exact final argv (same stats
+    /// port, same log subdir), so a restarted worker is indistinguishable
+    /// from the original to the stats poller and the log tailer.
+    miner: PathBuf,
+    args: Vec<String>,
+    /// Successful respawns so far (surfaced in the worker row).
+    restarts: u64,
+    /// Failures (exit or failed spawn) since the last stable run; drives the
+    /// exponential backoff and the give-up threshold.
+    consecutive_fails: u32,
+    /// When the next respawn attempt is allowed. `None` while alive or once
+    /// given up. Checked (never slept on) from the UI-thread `poll()`.
+    next_retry_at: Option<Instant>,
+    /// When the current child was spawned; a run longer than
+    /// [`RESTART_STABLE_WINDOW`] resets the failure streak.
+    last_spawn: Instant,
+    /// Set after [`RESTART_MAX_CONSECUTIVE_FAILS`]: the engine stops
+    /// respawning and the UI shows "failing repeatedly — check logs".
+    gave_up: bool,
+}
+
+impl Worker {
+    /// Record one failure (child exited, or a respawn attempt itself failed)
+    /// and either schedule the next attempt with exponential backoff or give
+    /// up for good.
+    fn note_failure(&mut self, now: Instant) {
+        self.consecutive_fails = self.consecutive_fails.saturating_add(1);
+        if self.consecutive_fails >= RESTART_MAX_CONSECUTIVE_FAILS {
+            self.gave_up = true;
+            self.next_retry_at = None;
+        } else {
+            self.next_retry_at = Some(now + restart_backoff(self.consecutive_fails));
+        }
+    }
 }
 
 pub struct Engine {
@@ -88,6 +142,10 @@ pub struct WorkerRow {
     pub hashrate_hps: f64,
     pub accepted: u64,
     pub rejected: u64,
+    /// Times the engine has respawned this worker after it died.
+    pub restarts: u64,
+    /// True once the engine stopped respawning it (kept failing).
+    pub gave_up: bool,
 }
 
 impl Engine {
@@ -150,17 +208,59 @@ impl Engine {
         self.workers.len()
     }
 
-    /// Poll every worker's stats endpoint and reap any that exited.
+    /// Poll every worker's stats endpoint, reap any that exited, and respawn
+    /// dead ones (same command, same stats port, same log subdir) with
+    /// exponential backoff. The miner exits BY DESIGN on persistent GPU
+    /// faults / wedges so a supervisor restarts it — on Windows, this engine
+    /// IS that supervisor, so reap-without-respawn would leave the card dead
+    /// for the rest of the session.
+    ///
+    /// Runs on the UI thread (egui immediate mode): it never sleeps — a
+    /// not-yet-due respawn is simply skipped until a later poll tick.
     pub fn poll(&mut self) {
+        let now = Instant::now();
         for w in &mut self.workers {
-            if matches!(w.child.try_wait(), Ok(Some(_))) {
-                w.alive = false;
-                w.last = None;
+            if w.alive {
+                if matches!(w.child.try_wait(), Ok(Some(_))) {
+                    // Worker exited (GPU-fault exit, watchdog exit(2), crash…).
+                    w.alive = false;
+                    w.last = None;
+                    // A long healthy run means this is a NEW incident: reset
+                    // the streak before counting this exit as failure #1.
+                    if now.duration_since(w.last_spawn) >= RESTART_STABLE_WINDOW {
+                        w.consecutive_fails = 0;
+                    }
+                    w.note_failure(now);
+                    continue;
+                }
+                // Still running; a long-enough run clears the failure streak.
+                if w.consecutive_fails > 0
+                    && now.duration_since(w.last_spawn) >= RESTART_STABLE_WINDOW
+                {
+                    w.consecutive_fails = 0;
+                }
+                if let Some(s) = stats::fetch(w.stats_port) {
+                    w.last = Some(s);
+                }
                 continue;
             }
-            w.alive = true;
-            if let Some(s) = stats::fetch(w.stats_port) {
-                w.last = Some(s);
+
+            // Dead: attempt a respawn once its backoff deadline has passed.
+            if w.gave_up || !w.next_retry_at.map(|t| now >= t).unwrap_or(false) {
+                continue;
+            }
+            match launch(&w.miner, &w.args) {
+                Ok(child) => {
+                    w.child = child;
+                    w.alive = true;
+                    w.last = None;
+                    w.last_spawn = now;
+                    w.next_retry_at = None;
+                    w.restarts = w.restarts.saturating_add(1);
+                }
+                // Spawn itself failed (exe missing/locked?): same escalation
+                // path as an exit, so this can't tight-loop either.
+                Err(_) => w.note_failure(now),
             }
         }
     }
@@ -202,6 +302,8 @@ impl Engine {
                     hashrate_hps: s.map(|s| s.hashrate_total_hps).unwrap_or(0.0),
                     accepted: s.map(|s| s.shares_accepted).unwrap_or(0),
                     rejected: s.map(|s| s.shares_rejected).unwrap_or(0),
+                    restarts: w.restarts,
+                    gave_up: w.gave_up,
                 }
             })
             .collect()
@@ -268,14 +370,7 @@ fn spawn_worker(
     args.push("--log-dir".into());
     args.push(log_dir.to_string_lossy().into_owned());
 
-    let mut cmd = Command::new(miner);
-    cmd.args(&args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let child = cmd.spawn()?;
+    let child = launch(miner, &args)?;
     Ok(Worker {
         label,
         kind,
@@ -284,7 +379,27 @@ fn spawn_worker(
         log_path,
         last: None,
         alive: true,
+        miner: miner.to_path_buf(),
+        args,
+        restarts: 0,
+        consecutive_fails: 0,
+        next_retry_at: None,
+        last_spawn: Instant::now(),
+        gave_up: false,
     })
+}
+
+/// Spawn one miner child process. Shared by the initial spawn and `poll()`'s
+/// respawn path so a restarted worker runs the exact same command.
+fn launch(miner: &Path, args: &[String]) -> std::io::Result<Child> {
+    let mut cmd = Command::new(miner);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.spawn()
 }
 
 fn short_tag(kind: &WorkerKind) -> String {
@@ -377,6 +492,78 @@ mod tests {
     #[test]
     fn free_port_nonzero() {
         assert_ne!(free_port(), 0);
+    }
+
+    #[test]
+    fn restart_backoff_doubles_and_caps() {
+        assert_eq!(restart_backoff(1), Duration::from_secs(2));
+        assert_eq!(restart_backoff(2), Duration::from_secs(4));
+        assert_eq!(restart_backoff(5), Duration::from_secs(32));
+        assert_eq!(restart_backoff(6), RESTART_BACKOFF_CAP); // 64s clamps to 60s
+        assert_eq!(restart_backoff(50), RESTART_BACKOFF_CAP);
+        // Defensive: a zero count (shouldn't happen) still yields the floor.
+        assert_eq!(restart_backoff(0), Duration::from_secs(2));
+    }
+
+    /// Drive the real respawn path with a child that dies instantly
+    /// (/bin/false stands in for the miner): the engine must schedule a
+    /// backed-off respawn, actually perform it once due, and — after the
+    /// failure streak hits the cap — park the worker with `gave_up` instead
+    /// of spinning forever. Unix-only (needs /bin/false).
+    #[cfg(unix)]
+    #[test]
+    fn poll_respawns_dead_worker_then_gives_up_after_repeated_failures() {
+        let spec = StartSpec {
+            miner_exe: PathBuf::from("/bin/false"),
+            address: "0123456789abcdef0123456789abcdef01234567".into(),
+            worker_base: "restarttest".into(),
+            pools: Vec::new(),
+            gpus: Vec::new(),
+            cpu_threads: Some(1),
+            log_dir: std::env::temp_dir().join("cairn-engine-restart-test"),
+        };
+        let mut engine = Engine::start(&spec).expect("engine start");
+        assert_eq!(engine.worker_count(), 1);
+
+        // Let the child exit, then poll: the death must be noted and a retry
+        // scheduled — not the old reap-and-forget.
+        std::thread::sleep(Duration::from_millis(200));
+        engine.poll();
+        assert!(!engine.workers[0].alive);
+        assert!(!engine.workers[0].gave_up);
+        assert_eq!(engine.workers[0].consecutive_fails, 1);
+        assert!(engine.workers[0].next_retry_at.is_some());
+
+        // Fast-forward the deadline (tests don't wait out real backoff): the
+        // next poll must respawn the same command on the same stats port.
+        let port_before = engine.workers[0].stats_port;
+        engine.workers[0].next_retry_at = Some(Instant::now());
+        engine.poll();
+        assert!(engine.workers[0].alive, "worker must be respawned when due");
+        assert_eq!(engine.workers[0].restarts, 1);
+        assert_eq!(engine.workers[0].stats_port, port_before);
+
+        // Keep fast-forwarding: the streak must reach the cap and park the
+        // worker rather than respawning forever.
+        let mut guard = 0;
+        while !engine.workers[0].gave_up {
+            std::thread::sleep(Duration::from_millis(30));
+            if let Some(t) = engine.workers[0].next_retry_at.as_mut() {
+                *t = Instant::now();
+            }
+            engine.poll();
+            guard += 1;
+            assert!(
+                guard < 10 * RESTART_MAX_CONSECUTIVE_FAILS,
+                "engine never gave up on a permanently failing worker"
+            );
+        }
+        assert!(!engine.workers[0].alive);
+        assert!(engine.workers[0].next_retry_at.is_none());
+        let rows = engine.rows();
+        assert!(rows[0].gave_up, "the row must surface the give-up for the UI");
+        assert!(rows[0].restarts >= 1);
+        engine.stop();
     }
 
     /// End-to-end: spawn a real CPU worker against the live pool via the engine

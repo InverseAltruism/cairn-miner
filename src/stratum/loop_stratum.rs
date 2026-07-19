@@ -24,9 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{HashOutcome, MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
@@ -119,6 +119,27 @@ struct CpuFind {
     hash: [u8; 32],
 }
 
+/// Should the GPU-hang watchdog kill the process? True only when ALL of:
+/// a launch is in flight (`armed` — set strictly around `hash_range`, so it
+/// also implies a job is active), the pool link is up (`connected` — a mid-
+/// outage rig gets no false restart), and the in-flight launch has made no
+/// progress for at least `limit`. Kept pure so the gating is unit-testable
+/// without a 120s stall.
+#[inline]
+fn watchdog_should_fire(armed: bool, connected: bool, stalled_for: Duration, limit: Duration) -> bool {
+    armed && connected && stalled_for >= limit
+}
+
+/// RAII flag: dropped on ANY exit path out of `run_stratum` (clean stop or
+/// `bail!`), telling the watchdog thread to wind down instead of outliving
+/// the loop.
+struct WatchdogStopGuard(Arc<AtomicBool>);
+impl Drop for WatchdogStopGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Run the pooled Stratum mining loop until `stop` is set.
 ///
 /// `client` must already be connected (handshake done, reader thread running).
@@ -172,6 +193,66 @@ pub fn run_stratum<B: MiningBackend>(
     const CHUNK_MAX: u32 = 1 << 30; // ~1.07B nonces
     let mut chunk_size: u32 = 1 << 24; // ~16.8M to start; adapts after each chunk
     let mut nonce_cursor: u32 = 0; // next nonce to sweep for the current job/xn2
+
+    // A GPU backend that errors this many times in a row is treated as fatally
+    // wedged (driver reset / XID / poisoned state): we exit `run_stratum` — and
+    // thus the process — so a supervisor (systemd Restart=always, mine-auto.sh,
+    // or the HiveOS agent) restarts the rig, instead of spinning forever mining
+    // nothing while the dashboard shows it "up". A single transient error just
+    // costs a short backoff.
+    const MAX_CONSECUTIVE_GPU_ERRORS: u32 = 3;
+    let mut consecutive_gpu_errors: u32 = 0;
+
+    // GPU-hang watchdog. The consecutive-error exit above only helps when
+    // `hash_range` RETURNS an error; a wedged driver call (cuStreamSynchronize
+    // / clFinish after an XID or bus reset) blocks forever, leaving a process
+    // that looks alive but mines nothing and that no in-process check can
+    // reach. So: the mining thread beats a heartbeat strictly around every
+    // `hash_range` call, and a monitor thread exits the process (code 2, so a
+    // supervisor restarts it) when an ARMED beat goes stale for WATCHDOG_STALL
+    // while the pool link is up. 120s is orders of magnitude above any healthy
+    // launch (chunks auto-tune toward ~400ms), so false positives need a
+    // genuinely wedged device. CPU backends skip the watchdog entirely —
+    // there's no driver call to wedge.
+    const WATCHDOG_STALL: Duration = Duration::from_secs(120);
+    let watchdog_epoch = Instant::now();
+    let hb_beat_ms = Arc::new(AtomicU64::new(0)); // ms since watchdog_epoch of the last beat
+    let hb_armed = Arc::new(AtomicBool::new(false)); // true only inside hash_range
+    let watchdog_done = Arc::new(AtomicBool::new(false));
+    let _watchdog_guard = WatchdogStopGuard(Arc::clone(&watchdog_done));
+    if backend.name() != "cpu" {
+        let beat = Arc::clone(&hb_beat_ms);
+        let armed = Arc::clone(&hb_armed);
+        let done = Arc::clone(&watchdog_done);
+        let stats_w = Arc::clone(&stats);
+        let backend_name = backend.name();
+        std::thread::Builder::new()
+            .name("gpu-watchdog".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                let stalled_for = Duration::from_millis(
+                    (watchdog_epoch.elapsed().as_millis() as u64)
+                        .saturating_sub(beat.load(Ordering::Relaxed)),
+                );
+                if watchdog_should_fire(
+                    armed.load(Ordering::Relaxed),
+                    stats_w.snapshot().connected,
+                    stalled_for,
+                    WATCHDOG_STALL,
+                ) {
+                    tracing::error!(
+                        "gpu watchdog: {backend_name} hash_range made no progress for {}s \
+                         (wedged driver call?); exiting so the supervisor restarts the miner",
+                        stalled_for.as_secs(),
+                    );
+                    std::process::exit(2);
+                }
+            })
+            .expect("spawning gpu watchdog thread");
+    }
 
     if cfg.cpu_threads > 0 && cfg.cpu_share > 0.0 {
         tracing::info!(
@@ -255,9 +336,11 @@ pub fn run_stratum<B: MiningBackend>(
                 break; // re-poll latest_job (may be the same; may be newer)
             }
             // If the pool pushed a new job, abandon this one immediately so we
-            // never mine stale work past a clean_jobs boundary.
+            // never mine stale work past a clean_jobs boundary. A changed
+            // extranonce1 (mining.set_extranonce re-key) invalidates the
+            // coinbase bases the same way, so it takes the same exit.
             if let Some(j) = client.latest_job() {
-                if j.notify.job_id != mapped.job_id {
+                if j.notify.job_id != mapped.job_id || j.extranonce1_hex != job.extranonce1_hex {
                     break;
                 }
             }
@@ -306,8 +389,10 @@ pub fn run_stratum<B: MiningBackend>(
             let cpu_swept = Arc::new(AtomicU64::new(0));
             let gpu_stop = Arc::new(AtomicBool::new(stop.load(Ordering::Relaxed)));
 
-            let gpu_result: Mutex<Option<MiningResult>> = Mutex::new(None);
-            let gpu_result_ref = &gpu_result;
+            // Carries the GPU sweep's outcome (or device error) out of the
+            // scope. Written once, by the scope's main thread.
+            let gpu_outcome: Mutex<Option<Result<HashOutcome>>> = Mutex::new(None);
+            let gpu_outcome_ref = &gpu_outcome;
 
             let midstate = midstate_of_first_chunk_fast(&hdr);
             let mut tail_template = [0u8; 20];
@@ -378,20 +463,69 @@ pub fn run_stratum<B: MiningBackend>(
                 });
 
                 // GPU sweep on its assigned sub-range (main scope thread).
+                // The heartbeat is armed strictly around the backend call so a
+                // driver call that never returns leaves an armed, stale beat
+                // for the watchdog to catch; idle time between launches
+                // (waiting for jobs, reconnects) can never trip it.
                 let (gstart, gend) = gpu_range;
                 let res = if gend > gstart {
-                    backend.hash_range(hdr, target, gstart, gend, &gpu_stop)
+                    hb_beat_ms.store(
+                        watchdog_epoch.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                    hb_armed.store(true, Ordering::Relaxed);
+                    let r = backend.hash_range(hdr, target, gstart, gend, &gpu_stop);
+                    hb_armed.store(false, Ordering::Relaxed);
+                    r
                 } else {
-                    None
+                    Ok(HashOutcome::none(0))
                 };
-                *gpu_result_ref.lock().unwrap() = res;
+                *gpu_outcome_ref.lock().unwrap() = Some(res);
                 iter_stop.store(true, Ordering::Release);
             });
 
-            let gpu_found = gpu_result.into_inner().unwrap();
+            // Wall time of the HASHING span only — captured before the error
+            // backoff below so a transient-fault sleep can't fool the chunk-size
+            // auto-tuner into shrinking chunk_size on a healthy device.
+            let chunk_elapsed = chunk_t0.elapsed();
+
+            // Interpret the GPU outcome. An error is NOT "found nothing": count
+            // it, and if the device keeps failing, exit so a supervisor restarts
+            // the rig. Only credit hashrate for nonces the GPU ACTUALLY hashed
+            // (`nonces_done`) — never the requested range — so a dead or
+            // short-circuited card can't report a phantom rate.
+            let gpu_outcome_res = gpu_outcome
+                .into_inner()
+                .unwrap()
+                .expect("gpu sweep runs once per chunk");
+            let (gpu_found, gpu_swept): (Option<MiningResult>, u128) = match gpu_outcome_res {
+                Ok(o) => {
+                    consecutive_gpu_errors = 0;
+                    (o.result, o.nonces_done as u128)
+                }
+                Err(e) => {
+                    consecutive_gpu_errors += 1;
+                    tracing::error!(
+                        "gpu backend error ({}/{}): {:#}",
+                        consecutive_gpu_errors,
+                        MAX_CONSECUTIVE_GPU_ERRORS,
+                        e
+                    );
+                    if consecutive_gpu_errors >= MAX_CONSECUTIVE_GPU_ERRORS {
+                        bail!(
+                            "gpu backend failed {} times in a row (last error: {:#}); \
+                             exiting so the supervisor can restart the miner",
+                            consecutive_gpu_errors,
+                            e
+                        );
+                    }
+                    // Transient: brief backoff, credit no hashrate, keep the session.
+                    std::thread::sleep(Duration::from_millis(500));
+                    (None, 0)
+                }
+            };
             let cpu_found = cpu_winner.lock().unwrap().clone();
             let cpu_swept_n = cpu_swept.load(Ordering::Relaxed) as u128;
-            let gpu_swept = (gpu_range.1 as u128).saturating_sub(gpu_range.0 as u128);
             gpu_nonces_since_log = gpu_nonces_since_log.saturating_add(gpu_swept);
             cpu_nonces_since_log = cpu_nonces_since_log.saturating_add(cpu_swept_n);
 
@@ -526,7 +660,7 @@ pub fn run_stratum<B: MiningBackend>(
             // every backend — but only after a full sweep, since a find
             // early-exits the backend and would skew the measured rate.
             if !found {
-                let ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
+                let ms = chunk_elapsed.as_secs_f64() * 1000.0;
                 if ms > 1.0 {
                     let scaled = (chunk_size as f64 * (CHUNK_TARGET_MS / ms))
                         .clamp(CHUNK_MIN as f64, CHUNK_MAX as f64);
@@ -628,6 +762,23 @@ mod tests {
         assert_eq!(zero, [0u8; 32]);
     }
 
+    // --- GPU-hang watchdog gating ---
+
+    #[test]
+    fn watchdog_fires_only_when_armed_connected_and_stalled() {
+        let limit = Duration::from_secs(120);
+        let stalled = Duration::from_secs(121);
+        let fresh = Duration::from_secs(3);
+        // The one lethal combination: launch in flight + pool up + stale beat.
+        assert!(watchdog_should_fire(true, true, stalled, limit));
+        // Every safety gate individually blocks the kill:
+        assert!(!watchdog_should_fire(false, true, stalled, limit)); // no launch in flight
+        assert!(!watchdog_should_fire(true, false, stalled, limit)); // pool link down
+        assert!(!watchdog_should_fire(true, true, fresh, limit)); // healthy progress
+        // Boundary: exactly at the limit fires (>=, not >).
+        assert!(watchdog_should_fire(true, true, limit, limit));
+    }
+
     // --- xn2-only rolling: composing the extranonce keeps xn1 fixed ---
 
     #[test]
@@ -657,11 +808,12 @@ mod tests {
             &self,
             _h: [u8; 84],
             _t: [u8; 32],
-            _s: u32,
-            _e: u32,
+            s: u32,
+            e: u32,
             _stop: &AtomicBool,
-        ) -> Option<MiningResult> {
-            None
+        ) -> Result<HashOutcome> {
+            // Swept the whole assigned range, found nothing (no GPU here).
+            Ok(HashOutcome::none(e.saturating_sub(s) as u64))
         }
     }
 
@@ -748,6 +900,8 @@ mod tests {
         let g = NullGpu;
         assert!(g
             .hash_range(hdr, easy_target, 0, 64, &AtomicBool::new(false))
+            .unwrap()
+            .result
             .is_none());
     }
 
@@ -861,5 +1015,104 @@ mod tests {
             !post_handshake.contains("mining.submit"),
             "did not expect a submit in the brief hard-difficulty window, got: {post_handshake:?}"
         );
+    }
+
+    /// A backend that always faults. Used to prove the loop treats a wedged
+    /// device as fatal (exits so a supervisor restarts) rather than looping
+    /// forever mining nothing.
+    struct ErrGpu;
+    impl MiningBackend for ErrGpu {
+        fn name(&self) -> &'static str {
+            "err-gpu"
+        }
+        fn hash_range(
+            &self,
+            _h: [u8; 84],
+            _t: [u8; 32],
+            _s: u32,
+            _e: u32,
+            _stop: &AtomicBool,
+        ) -> Result<HashOutcome> {
+            anyhow::bail!("simulated device fault")
+        }
+    }
+
+    /// With a live job available, a backend that faults on every chunk must make
+    /// `run_stratum` return `Err` (after `MAX_CONSECUTIVE_GPU_ERRORS`) so the
+    /// process exits and a supervisor restarts it — NOT spin silently.
+    #[test]
+    fn run_stratum_exits_after_repeated_gpu_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut br = BufReader::new(sock.try_clone().unwrap());
+            // Read subscribe + authorize.
+            let mut req = String::new();
+            br.read_line(&mut req).unwrap();
+            req.clear();
+            br.read_line(&mut req).unwrap();
+            // Same handshake + one notify as the clean-shutdown test.
+            sock.write_all(
+                b"{\"id\":1,\"result\":[[[\"mining.notify\",\"1\"]],\"aabbccdd\",4],\"error\":null}\n",
+            )
+            .unwrap();
+            sock.write_all(b"{\"id\":2,\"result\":true,\"error\":null}\n").unwrap();
+            sock.write_all(
+                b"{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[1024.0]}\n",
+            )
+            .unwrap();
+            sock.write_all(
+                b"{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"jobZ\",\"00000000000000000000000000000000000000000000000000000000000000ff\",\"01000000\",\"00000000\",[],\"20000000\",\"1d00ffff\",\"60c0babe\",true]}\n",
+            )
+            .unwrap();
+            sock.flush().unwrap();
+            // Keep the connection open long enough for the loop to accrue its
+            // fatal error streak (3 faults × 500ms backoff ≈ 1s).
+            std::thread::sleep(Duration::from_secs(4));
+        });
+
+        let client =
+            StratumClient::connect(&addr.to_string(), "csd1testworker").expect("connect ok");
+
+        // Wait for the pushed job so the loop has real work to fault on.
+        let mut got_job = false;
+        for _ in 0..50 {
+            if client.latest_job().is_some() {
+                got_job = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(got_job, "client should surface the pushed job");
+
+        // Watchdog: if the loop DOESN'T exit on its own (regression), stop it
+        // after 10s so the test fails on the assert below instead of hanging.
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_wd = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(10));
+            stop_wd.store(true, Ordering::Relaxed);
+        });
+
+        let backend = ErrGpu;
+        let cfg = MiningConfig {
+            cpu_threads: 0,
+            cpu_share: 0.0,
+        };
+        let result = run_stratum(&backend, &client, stop, cfg);
+
+        assert!(
+            result.is_err(),
+            "run_stratum must exit with Err after repeated GPU faults (got Ok — it kept spinning)"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("gpu backend failed"),
+            "exit error should explain the fatal fault streak, got: {msg:?}"
+        );
+
+        let _ = server.join();
     }
 }

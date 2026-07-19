@@ -16,12 +16,18 @@ name: release
 #                                     the all-backends miner is embedded inside it,
 #                                     so this single file is all a Windows user needs)
 #   cairn-miner-hiveos.tar.gz       (HiveOS custom miner package)
+#   install.sh / install.ps1 / install.bat / mine-auto.sh   (installer scripts,
+#                                     so `releases/latest/download/install.sh`
+#                                     always matches the released binaries)
 #   SHA256SUMS                      (checksums of every asset above)
 #   latest-version.txt              (the release version, for the update beacon)
 #
 # The Linux binaries are built with cargo-zigbuild against an OLD glibc floor so
 # they run on HiveOS (glibc 2.27+) as well as current distros. GPU builds are
-# continue-on-error so a GPU toolchain hiccup never blocks the CPU release.
+# continue-on-error so a GPU toolchain hiccup never blocks a workflow_dispatch
+# smoke build — but TAGGED releases hard-require the CUDA artifact (see the
+# release gates below): shipping a CPU-only HiveOS tarball or launcher would
+# silently turn GPU rigs into CPU miners.
 
 on:
   push:
@@ -73,11 +79,18 @@ jobs:
         run: |
           cargo build --release --features "cuda,opencl"
           if ($LASTEXITCODE -eq 0) { Copy-Item target/release/cairn-miner.exe embed-miner.exe }
-      - name: Choose embed miner (all-backends, else CPU) and export path
+      # RELEASE GATE: a tagged release must not silently ship a launcher with
+      # only the CPU miner inside — Windows GPU users would mine at CPU speed.
+      # workflow_dispatch smoke builds keep the CPU fallback.
+      - name: Choose embed miner (all-backends; CPU fallback only untagged)
         shell: pwsh
         run: |
           if (-not (Test-Path embed-miner.exe)) {
-            Write-Host "all-backends build unavailable; embedding the CPU miner"
+            if ("$env:GITHUB_REF".StartsWith("refs/tags/")) {
+              Write-Host "::error::all-backends (cuda,opencl) miner build failed - refusing to embed the CPU miner in a tagged release launcher"
+              exit 1
+            }
+            Write-Host "all-backends build unavailable; embedding the CPU miner (untagged smoke build)"
             Copy-Item dist/cairn-miner-windows-cpu.exe embed-miner.exe
           }
           "CAIRN_MINER_BIN=$((Resolve-Path embed-miner.exe).Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -120,13 +133,46 @@ jobs:
       - name: Install OpenCL loader + headers (for the AMD build)
         continue-on-error: true
         run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+      # Same zigbuild glibc-2.27 floor as cpu/cuda (this asset used to be the
+      # only one built with plain cargo, i.e. pinned to the runner's glibc).
+      # The -L points zig's linker at the distro's libOpenCL ICD loader stub;
+      # only the soname is recorded, so the floor still holds at runtime.
       - name: Build AMD (opencl)
         continue-on-error: true
         run: |
-          cargo build --release --features opencl
-          cp target/release/cairn-miner dist/cairn-miner-linux-opencl-x86_64
-      - name: Build HiveOS package (bundles the CPU seed)
-        run: bash packaging/build-hiveos-package.sh dist/cairn-miner-linux-cpu-x86_64 dist/cairn-miner-hiveos.tar.gz
+          RUSTFLAGS="-L /usr/lib/x86_64-linux-gnu" cargo zigbuild --release --features opencl --target x86_64-unknown-linux-gnu.2.27
+          cp target/x86_64-unknown-linux-gnu/release/cairn-miner dist/cairn-miner-linux-opencl-x86_64
+      # HiveOS binary: the CUDA build (glibc-2.27 floor, from the step above).
+      # HiveOS rigs are overwhelmingly NVIDIA, and cudarc dlopen's the driver at
+      # runtime (no hard lib dependency), so the cuda binary starts anywhere and
+      # falls back to CPU via --backend auto. We deliberately do NOT ship the
+      # opencl-linked binary here: opencl-sys puts a hard DT_NEEDED on
+      # libOpenCL.so.1, so that binary fails to start on any rig lacking the ICD
+      # loader — a worse default for the NVIDIA majority. (AMD HiveOS rigs: use
+      # one flight-sheet slot per card with --backend opencl for now.)
+      # RELEASE GATE: a tagged release must never ship a CPU-only HiveOS
+      # tarball — every NVIDIA rig on the farm would silently mine at CPU
+      # speed. The CUDA build step stays continue-on-error so untagged
+      # workflow_dispatch smoke runs still exercise the rest of the pipeline.
+      - name: Require the CUDA binary on tagged releases
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [ ! -f dist/cairn-miner-linux-cuda-x86_64 ]; then
+            echo "::error::CUDA build failed/missing — refusing to publish a CPU-only HiveOS package for a tagged release"
+            exit 1
+          fi
+      - name: Pick the HiveOS binary (cuda; cpu fallback only untagged)
+        id: pick_hiveos
+        run: |
+          if [ -f dist/cairn-miner-linux-cuda-x86_64 ]; then
+            echo "bin=dist/cairn-miner-linux-cuda-x86_64" >> "$GITHUB_OUTPUT"
+            echo "HiveOS binary: CUDA (glibc 2.27 floor)"
+          else
+            echo "bin=dist/cairn-miner-linux-cpu-x86_64" >> "$GITHUB_OUTPUT"
+            echo "::warning::CUDA build unavailable; HiveOS package will be CPU-only (rigs cannot GPU-mine)"
+          fi
+      - name: Build HiveOS package (GPU binary + tag-stamped version)
+        run: bash packaging/build-hiveos-package.sh "${{ steps.pick_hiveos.outputs.bin }}" dist/cairn-miner-hiveos.tar.gz "${GITHUB_REF_NAME#v}"
       - name: Upload linux artifacts
         uses: actions/upload-artifact@v4
         with: { name: linux, path: dist/* }
@@ -136,15 +182,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      # Checkout so the installer scripts ship as release assets too — that way
+      # `releases/latest/download/install.sh` etc. always match this release.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { path: staged }
       - name: Collect assets + build manifests
         run: |
           mkdir -p dist && find staged -type f -exec cp {} dist/ \;
+          cp install.sh install.ps1 install.bat mine-auto.sh dist/
           cd dist
           # version beacon from the tag (v0.1.0 -> 0.1.0)
           echo "${GITHUB_REF_NAME#v}" > latest-version.txt
-          sha256sum cairn-miner-* > SHA256SUMS
+          sha256sum cairn-miner-* install.sh install.ps1 install.bat mine-auto.sh > SHA256SUMS
           ls -la
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2

@@ -33,7 +33,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::backend::{MiningBackend, MiningResult};
+use crate::backend::{HashOutcome, MiningBackend, MiningResult};
 use crate::sha256d_cpu::midstate_of_first_chunk_fast as midstate_of_first_chunk;
 
 // CUDA kernel, pre-compiled to PTX *offline* (nvcc -ptx -arch=compute_75
@@ -220,9 +220,9 @@ impl MiningBackend for CudaBackend {
         nonce_start: u32,
         nonce_end: u32,
         stop: &AtomicBool,
-    ) -> Option<MiningResult> {
+    ) -> Result<HashOutcome> {
         if nonce_end <= nonce_start {
-            return None;
+            return Ok(HashOutcome::none(0));
         }
 
         let midstate = midstate_of_first_chunk(&header_84);
@@ -231,27 +231,22 @@ impl MiningBackend for CudaBackend {
 
         // iter-hotpath #2: borrow the persistent pipes for this call
         // instead of rebuilding them. The mutex is uncontended in
-        // practice — each backend is owned by one mining thread.
-        let mut pipes = match self.pipes.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!("cuda: pipes mutex poisoned: {}", e);
-                return None;
-            }
-        };
+        // practice — each backend is owned by one mining thread. A
+        // poisoned mutex means a prior launch panicked → surface it as an
+        // error so the caller can restart, never as "found nothing".
+        let mut pipes = self
+            .pipes
+            .lock()
+            .map_err(|e| anyhow!("cuda pipes mutex poisoned: {e}"))?;
 
         // Re-prime BOTH pipes with the current header's midstate, tail
         // and target. This is the per-launch hot path that replaces
         // the old setup_pipe() — 6 small H2D memcpys (3 per pipe) and
         // zero allocations.
-        if let Err(e) = prime_pipe(&mut pipes.a, &midstate, &tail_16, &target) {
-            tracing::error!("cuda: prime pipe A failed: {}", e);
-            return None;
-        }
-        if let Err(e) = prime_pipe(&mut pipes.b, &midstate, &tail_16, &target) {
-            tracing::error!("cuda: prime pipe B failed: {}", e);
-            return None;
-        }
+        prime_pipe(&mut pipes.a, &midstate, &tail_16, &target)
+            .map_err(|e| anyhow!("cuda prime pipe A: {e}"))?;
+        prime_pipe(&mut pipes.b, &midstate, &tail_16, &target)
+            .map_err(|e| anyhow!("cuda prime pipe B: {e}"))?;
 
         let cfg = LaunchConfig {
             grid_dim: (self.blocks, 1, 1),
@@ -262,6 +257,8 @@ impl MiningBackend for CudaBackend {
         let nonces_per_launch = self.nonces_per_launch();
         let mut next_start: u64 = nonce_start as u64;
         let mut current_pipe = 0u8;
+        // Nonces launched so far → honest hashrate on every exit path.
+        let done = |next: u64| next.saturating_sub(nonce_start as u64);
 
         // Destructure once so the borrow checker treats a / b / func as
         // disjoint fields (otherwise selecting `&mut pipes.a` inside
@@ -271,21 +268,23 @@ impl MiningBackend for CudaBackend {
 
         loop {
             if stop.load(Ordering::Relaxed) {
-                return None;
+                return Ok(HashOutcome::none(done(next_start)));
             }
 
             // Drain the current pipe if in flight. Reset `in_flight` BEFORE
             // using the result: the old code returned with the flag left true,
             // so this pipe's found buffer (found_flag=1, found_nonce=X) leaked
             // into the next hash_range call, which re-drained it and re-submitted
-            // the SAME nonce — the duplicate-share bug. It only surfaced at low
+            // the SAME nonce - the duplicate-share bug. It only surfaced at low
             // difficulty, where nearly every chunk finds and so the reset path
             // (drain -> None) never ran; fast cards at high diff cleared it every
             // launch and never saw it. The OpenCL backend already does this.
+            // A driver/copy fault here is a real error (`?`), not a silent
+            // "no solution".
             let drain_result = {
                 let pipe: &mut PipeRes = if current_pipe == 0 { &mut *a } else { &mut *b };
                 if pipe.in_flight {
-                    let res = drain_pipe(pipe);
+                    let res = drain_pipe(pipe)?;
                     pipe.in_flight = false;
                     res
                 } else {
@@ -294,13 +293,18 @@ impl MiningBackend for CudaBackend {
             };
             if let Some(res) = drain_result {
                 // Drain the sibling too so its abandoned in-flight launch can't
-                // leak into the next call either.
+                // leak into the next call either. Do NOT `?` here: we already
+                // hold a found share, and a sibling fault will resurface on its
+                // own next launch/drain; losing the share now helps nobody.
                 let other: &mut PipeRes = if current_pipe == 0 { &mut *b } else { &mut *a };
                 if other.in_flight {
                     let _ = drain_pipe(other);
                     other.in_flight = false;
                 }
-                return Some(res);
+                return Ok(HashOutcome {
+                    result: Some(res),
+                    nonces_done: done(next_start),
+                });
             }
 
             if next_start < nonce_end as u64 {
@@ -309,9 +313,9 @@ impl MiningBackend for CudaBackend {
                 if launch_size > 0 {
                     let start_u32 = next_start as u32;
                     let zeros = [0u32];
-                    if pipe.stream.memcpy_htod(&zeros, &mut pipe.found_flag).is_err() {
-                        return None;
-                    }
+                    pipe.stream
+                        .memcpy_htod(&zeros, &mut pipe.found_flag)
+                        .map_err(|e| anyhow!("cuda reset found_flag: {e}"))?;
                     let end_u32 = nonce_end;
 
                     let mut builder = pipe.stream.launch_builder(func);
@@ -324,15 +328,13 @@ impl MiningBackend for CudaBackend {
                     builder.arg(&mut pipe.found_nonce);
                     builder.arg(&mut pipe.found_flag);
                     builder.arg(&mut pipe.found_hash);
-                    let launch_result = unsafe { builder.launch(cfg) };
-                    if launch_result.is_err() {
-                        return None;
-                    }
+                    unsafe { builder.launch(cfg) }
+                        .map_err(|e| anyhow!("cuda kernel launch: {e}"))?;
                     pipe.in_flight = true;
                     next_start = next_start.saturating_add(launch_size);
                 }
             } else if !a.in_flight && !b.in_flight {
-                return None;
+                return Ok(HashOutcome::none(done(next_start)));
             }
 
             current_pipe ^= 1;
@@ -340,21 +342,35 @@ impl MiningBackend for CudaBackend {
     }
 }
 
-fn drain_pipe(pipe: &mut PipeRes) -> Option<MiningResult> {
-    pipe.stream.synchronize().ok()?;
-    let flag_host: Vec<u32> = pipe.stream.clone_dtoh(&pipe.found_flag).ok()?;
+/// Synchronize a launched pipe and read back any solution.
+/// `Ok(Some)` = found, `Ok(None)` = launched but no solution, `Err` = a
+/// device/copy fault (the caller treats repeated faults as fatal + restarts).
+fn drain_pipe(pipe: &mut PipeRes) -> Result<Option<MiningResult>> {
+    pipe.stream
+        .synchronize()
+        .map_err(|e| anyhow!("cuda synchronize: {e}"))?;
+    let flag_host: Vec<u32> = pipe
+        .stream
+        .clone_dtoh(&pipe.found_flag)
+        .map_err(|e| anyhow!("cuda read found_flag: {e}"))?;
     if flag_host[0] == 0 {
-        return None;
+        return Ok(None);
     }
-    let nonce_host: Vec<u32> = pipe.stream.clone_dtoh(&pipe.found_nonce).ok()?;
-    let hash_host: Vec<u32> = pipe.stream.clone_dtoh(&pipe.found_hash).ok()?;
+    let nonce_host: Vec<u32> = pipe
+        .stream
+        .clone_dtoh(&pipe.found_nonce)
+        .map_err(|e| anyhow!("cuda read found_nonce: {e}"))?;
+    let hash_host: Vec<u32> = pipe
+        .stream
+        .clone_dtoh(&pipe.found_hash)
+        .map_err(|e| anyhow!("cuda read found_hash: {e}"))?;
     let mut hash = [0u8; 32];
     for i in 0..8 {
         let be = hash_host[i].to_be_bytes();
         hash[4 * i..4 * i + 4].copy_from_slice(&be);
     }
-    Some(MiningResult {
+    Ok(Some(MiningResult {
         nonce: nonce_host[0],
         hash,
-    })
+    }))
 }
