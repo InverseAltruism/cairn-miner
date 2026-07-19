@@ -82,6 +82,29 @@ rigs are handled per card.
 cairn-miner newwallet     # generates an addr20 locally; the private key never leaves your machine
 ```
 
+## Watch your rig (terminal dashboard)
+
+A read-only live view of a running miner — hashrate, accepted/rejected/**stale**
+shares + reject %, difficulty, uptime, reconnects, and GPU temp/power (when
+`nvidia-smi` is present). The Windows launcher already shows all this in its GUI;
+this is the equivalent for **headless HiveOS/Linux** (and a Windows terminal).
+
+The miner must be running with a stats port (HiveOS sets `--stats-port 3380`
+automatically; otherwise add it yourself). Then:
+
+```sh
+# Linux / macOS / HiveOS
+curl -fsSLO https://github.com/InverseAltruism/cairn-miner/releases/latest/download/cairn-dashboard.sh
+chmod +x cairn-dashboard.sh && ./cairn-dashboard.sh          # --port N, --refresh N, --once
+```
+
+```powershell
+# Windows: download cairn-dashboard.bat (+ .ps1) from the latest release and run it.
+```
+
+Multi-GPU rigs are aggregated automatically (one worker per card on consecutive
+ports). Press `q` or Ctrl-C to quit. Runs on a stock shell — no extra tools.
+
 ## Point it at any pool
 
 ```sh

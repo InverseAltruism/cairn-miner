@@ -194,10 +194,13 @@ jobs:
         run: |
           mkdir -p dist && find staged -type f -exec cp {} dist/ \;
           cp install.sh install.ps1 install.bat mine-auto.sh dist/
+          # terminal dashboards ("watch your rig" for headless/Windows users)
+          cp dashboard/cairn-dashboard.sh dashboard/cairn-dashboard.ps1 dashboard/cairn-dashboard.bat dist/
           cd dist
           # version beacon from the tag (v0.1.0 -> 0.1.0)
           echo "${GITHUB_REF_NAME#v}" > latest-version.txt
-          sha256sum cairn-miner-* install.sh install.ps1 install.bat mine-auto.sh > SHA256SUMS
+          sha256sum cairn-miner-* install.sh install.ps1 install.bat mine-auto.sh \
+            cairn-dashboard.sh cairn-dashboard.ps1 cairn-dashboard.bat > SHA256SUMS
           ls -la
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
