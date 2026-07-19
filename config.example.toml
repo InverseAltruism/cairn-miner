@@ -56,3 +56,7 @@
 #blocks = 560
 #threads_per_block = 256
 #nonces_per_thread = 4096
+
+# Send mining.suggest_difficulty at startup so the pool starts you near your
+# real difficulty instead of ramping up (default true).
+#suggest_difficulty = true

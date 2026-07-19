@@ -46,6 +46,9 @@ pub struct FileConfig {
     pub cpu_share: Option<f32>,
     /// GPU device index to mine on.
     pub device: Option<usize>,
+    /// Send `mining.suggest_difficulty` at startup (default true). Set false to
+    /// opt out via the config file instead of the `--no-suggest-difficulty` flag.
+    pub suggest_difficulty: Option<bool>,
 }
 
 impl FileConfig {

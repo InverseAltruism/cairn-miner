@@ -378,6 +378,13 @@ fn merge_config(cli: &mut Cli, matches: &clap::ArgMatches, file: config_file::Fi
             cli.device = v;
         }
     }
+    // Config key is the positive `suggest_difficulty` (readable); the CLI flag is
+    // the inverted `--no-suggest-difficulty`, and an explicit flag always wins.
+    if !explicit("no_suggest_difficulty") {
+        if let Some(v) = file.suggest_difficulty {
+            cli.no_suggest_difficulty = !v;
+        }
+    }
 }
 
 fn main() {
