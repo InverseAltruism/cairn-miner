@@ -52,16 +52,31 @@ Write-Host "  backend:  $Backend"
 Write-Host "  address:  $Address"
 Write-Host ("  pool:     " + $(if($Pool){$Pool}else{$DefaultPool}))
 
-# 3. download the matching prebuilt exe
-$asset = "cairn-miner-windows-$Backend.exe"
-$url   = "https://github.com/$Repo/releases/latest/download/$asset"
+# 3. download the matching prebuilt exe + verify it against the release SHA256SUMS
+$asset    = "cairn-miner-windows-$Backend.exe"
+$url      = "https://github.com/$Repo/releases/latest/download/$asset"
+$sumsUrl  = "https://github.com/$Repo/releases/latest/download/SHA256SUMS"
 try {
   Write-Host "  downloading $asset ..."
   Invoke-WebRequest -Uri $url -OutFile "$bin.tmp" -UseBasicParsing
+
+  # FAIL CLOSED: fetch SHA256SUMS, find this asset's line, compare. Never keep an
+  # unverified binary. Mirrors install.sh / mine-auto.sh.
+  $sumsTmp = "$bin.sums.tmp"
+  Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsTmp -UseBasicParsing
+  $want = (Select-String -Path $sumsTmp -Pattern ("[0-9a-fA-F]{64}\s+\*?" + [regex]::Escape($asset) + "$") |
+           Select-Object -First 1).Line -replace '\s.*$',''
+  Remove-Item -Force $sumsTmp -ErrorAction SilentlyContinue
+  $got = (Get-FileHash -Algorithm SHA256 "$bin.tmp").Hash
+  if (-not $want -or ($want.ToLower() -ne $got.ToLower())) {
+    Remove-Item -Force "$bin.tmp" -ErrorAction SilentlyContinue
+    Die "checksum verification FAILED for $asset (want=$want got=$got). Not installing an unverified binary."
+  }
   Move-Item -Force "$bin.tmp" $bin
-  Grn "  [ok] installed $asset"
+  Grn "  [ok] installed $asset (sha256 verified)"
 } catch {
-  Die "could not download $asset (no published release yet for this backend?). Try -Backend cpu, or build from source: cargo build --release"
+  Remove-Item -Force "$bin.tmp" -ErrorAction SilentlyContinue
+  Die "could not download/verify $asset (no published release yet for this backend, or verification failed). Try -Backend cpu, or build from source: cargo build --release"
 }
 
 # Microsoft VC++ runtime (GPU builds need it); install via winget if missing.

@@ -78,9 +78,23 @@ download(){ # url out
   else return 1; fi
 }
 REL_URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
-if download "$REL_URL" "$BIN" 2>/dev/null && [ -s "$BIN" ]; then
-  chmod +x "$BIN"; grn "  [ok] installed prebuilt $ASSET"
+SUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
+# Verify the downloaded binary against the release SHA256SUMS before trusting it.
+# FAIL CLOSED: a present-but-unverifiable binary is deleted and we fall through to
+# build-from-source, never run an unverified download. Mirrors mine-auto.sh.
+verify_asset(){ # binpath -> 0 ok / 1 fail
+  local bin="$1" sums="$DATA_DIR/SHA256SUMS.tmp" want got
+  command -v sha256sum >/dev/null 2>&1 || { say "  [warn] sha256sum not found - cannot verify download"; return 1; }
+  download "$SUMS_URL" "$sums" 2>/dev/null || { say "  [warn] could not fetch SHA256SUMS"; return 1; }
+  want="$(grep -E "  \\*?${ASSET}\$" "$sums" | awk '{print $1}' | head -1)"
+  got="$(sha256sum "$bin" | awk '{print $1}')"
+  rm -f "$sums"
+  [ -n "$want" ] && [ "$want" = "$got" ]
+}
+if download "$REL_URL" "$BIN" 2>/dev/null && [ -s "$BIN" ] && verify_asset "$BIN"; then
+  chmod +x "$BIN"; grn "  [ok] installed prebuilt $ASSET (sha256 verified)"
 else
+  [ -s "$BIN" ] && { rm -f "$BIN"; say "  [warn] prebuilt $ASSET failed checksum verification - not using it"; }
   say "  no prebuilt $ASSET published yet - building from source with cargo..."
   command -v cargo >/dev/null 2>&1 || die "cargo (Rust) not found. Install Rust from https://rustup.rs then re-run, or wait for a published release."
   SRC="$DATA_DIR/src"
