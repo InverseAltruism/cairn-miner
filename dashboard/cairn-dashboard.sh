@@ -16,7 +16,7 @@
 #   ./cairn-dashboard.sh --once          # print one frame and exit
 #
 # Pure POSIX sh + curl + awk - no jq, no extra deps (stock HiveOS shell works).
-# Press q or Ctrl-C to quit.
+# Press Ctrl-C to quit.
 
 set -u
 
@@ -27,8 +27,11 @@ MAX_GPUS=16   # cap the upward port probe
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port)    PORT="${2:-3380}"; shift 2 ;;
-    --refresh) REFRESH="${2:-2}"; shift 2 ;;
+    # `shift 2 || shift` guards the case where a value flag is the LAST arg:
+    # `shift 2` with one arg left fails and (in ash/bash) shifts nothing, which
+    # would spin the loop forever at 100% CPU; the `|| shift` clears it instead.
+    --port)    PORT="${2:-3380}"; shift 2 2>/dev/null || shift ;;
+    --refresh) REFRESH="${2:-2}"; shift 2 2>/dev/null || shift ;;
     --once)    ONCE=1; shift ;;
     -h|--help)
       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -73,11 +76,12 @@ dur() {
   }'
 }
 
-# gpu_tp <index> -> "62C 210W" via nvidia-smi, or empty.
+# gpu_tp <index> -> "62C 210W" via nvidia-smi, or empty (blank when a field is
+# non-numeric, e.g. "[N/A]" on some laptop/vGPU setups - never a bogus "0C 0W").
 gpu_tp() {
   [ "$HAVE_NVSMI" = 1 ] || return 0
   nvidia-smi --query-gpu=temperature.gpu,power.draw --format=csv,noheader,nounits -i "$1" 2>/dev/null \
-    | awk -F',' 'NR==1{gsub(/ /,""); printf "%dC %dW", $1, $2}'
+    | awk -F',' 'NR==1{gsub(/ /,""); if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9.]+$/) printf "%dC %dW", $1, $2}'
 }
 
 render() {
@@ -122,16 +126,20 @@ render() {
   up="$(dur "$(jnum "$base" uptime_secs)")"; pool="$(jstr "$base" pool)"
   lsa="$(jnum "$base" last_share_age_secs)"
   if [ -z "$lsa" ]; then last_share="no shares yet"; else last_share="${lsa}s ago"; fi
-  rejpct="$(awk -v a="$tot_acc" -v r="$tot_rej" 'BEGIN{t=a+r; if(t>0) printf "%.1f", 100*r/t; else print "0.0"}')"
+  # "reject %" is the BAD-reject rate (rejected minus stale): stale shares are
+  # valid work that lost the tip race and aren't a rig fault, so folding them in
+  # would inflate the number most pools don't even penalize. Both counts are
+  # shown so the subset relationship (stale ⊆ rejected) is visible.
+  rejpct="$(awk -v a="$tot_acc" -v r="$tot_rej" -v s="$tot_stale" 'BEGIN{bad=r-s; if(bad<0)bad=0; t=a+r; if(t>0) printf "%.1f", 100*bad/t; else print "0.0"}')"
 
   printf '  cairn-miner v%s  ·  %s  ·  pool %s  ·  up %s\n' "${ver:-?}" "${be:-?}" "${pool:-?}" "$up"
   printf '  ----------------------------------------------------------------------\n'
-  printf '  TOTAL  %s   accepted %s   rejected %s (%s%%)   stale %s   last share %s\n' \
-    "$(hr "$tot_hps")" "$tot_acc" "$tot_rej" "$rejpct" "$tot_stale" "$last_share"
+  printf '  TOTAL  %s   accepted %s   rejected %s (stale %s)   bad-reject %s%%   last share %s\n' \
+    "$(hr "$tot_hps")" "$tot_acc" "$tot_rej" "$tot_stale" "$rejpct" "$last_share"
   printf '  workers (%s):\n' "$n_up"
   printf '%s' "$rows"
   printf '  ----------------------------------------------------------------------\n'
-  printf '  refresh %ss · q or Ctrl-C to quit\n' "$REFRESH"
+  printf '  refresh %ss · Ctrl-C to quit\n' "$REFRESH"
 }
 
 if [ "$ONCE" = 1 ]; then
@@ -139,14 +147,12 @@ if [ "$ONCE" = 1 ]; then
   exit 0
 fi
 
-# Interactive loop: render, then wait REFRESH seconds OR until the user hits 'q'.
+# Interactive loop: render, wait REFRESH seconds, repeat. Ctrl-C quits (the trap
+# restores a clean line). A plain `sleep` is used rather than `read -t` so the
+# refresh cadence is exactly REFRESH on every shell (dash/ash/bash) — `read -t`
+# both waits AND then the fallback would sleep, double-delaying on bash.
 trap 'printf "\n"; exit 0' INT TERM
 while :; do
   render
-  # read -t is not POSIX-guaranteed but works in bash/busybox ash; fall back to sleep.
-  if read -t "$REFRESH" -r key 2>/dev/null; then
-    case "$key" in q|Q) break ;; esac
-  else
-    sleep "$REFRESH" 2>/dev/null || sleep 2
-  fi
+  sleep "$REFRESH" 2>/dev/null || sleep 2
 done

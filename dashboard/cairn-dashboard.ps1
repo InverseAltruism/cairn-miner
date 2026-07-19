@@ -76,12 +76,15 @@ function Render {
     Write-Host "  start the miner with  --stats-port $Port"
     return
   }
-  $rejpct = if (($totAcc + $totRej) -gt 0) { '{0:N1}' -f (100.0*$totRej/($totAcc+$totRej)) } else { '0.0' }
+  # bad-reject rate excludes stale (valid work that lost the tip race); both
+  # counts shown so stale-as-subset-of-rejected is clear.
+  $bad = [Math]::Max(0, $totRej - $totStale)
+  $rejpct = if (($totAcc + $totRej) -gt 0) { '{0:N1}' -f (100.0*$bad/($totAcc+$totRej)) } else { '0.0' }
   $lastShare = if ($null -eq $base.last_share_age_secs) { 'no shares yet' } else { "$($base.last_share_age_secs)s ago" }
 
   Write-Host ('  cairn-miner v{0}  ·  {1}  ·  pool {2}  ·  up {3}' -f $base.version, $base.backend, $base.pool, (Format-Dur ([int]$base.uptime_secs)))
   Write-Host '  ----------------------------------------------------------------------'
-  Write-Host ('  TOTAL  {0}   accepted {1}   rejected {2} ({3}%)   stale {4}   last share {5}' -f (Format-Hr $totHps), $totAcc, $totRej, $rejpct, $totStale, $lastShare)
+  Write-Host ('  TOTAL  {0}   accepted {1}   rejected {2} (stale {3})   bad-reject {4}%   last share {5}' -f (Format-Hr $totHps), $totAcc, $totRej, $totStale, $rejpct, $lastShare)
   Write-Host ('  workers ({0}):' -f $nUp)
   $rows | ForEach-Object { Write-Host $_ }
   Write-Host '  ----------------------------------------------------------------------'
