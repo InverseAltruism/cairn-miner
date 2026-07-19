@@ -29,8 +29,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 
 use super::protocol::{
-    authorize_request, serialize_line, subscribe_request, submit_request, NotifyParams,
-    Notification, Response, SubscribeResult,
+    authorize_request, serialize_line, subscribe_request, submit_request,
+    suggest_difficulty_request, NotifyParams, Notification, Response, SubscribeResult,
 };
 use crate::stats::MinerStats;
 
@@ -100,6 +100,12 @@ struct Shared {
     extranonce1_hex: Mutex<String>,
     /// extranonce2 byte width from the subscribe result (the bridge sends 4).
     extranonce2_size: AtomicU64,
+    /// Difficulty to send via `mining.suggest_difficulty` after authorize,
+    /// bit-encoded as an `f64` in an `AtomicU64`; `0` means "not measured yet, do
+    /// not suggest". Set once the mining loop has a real hashrate reading (see
+    /// `StratumClient::suggest_difficulty`) so every subsequent reconnect
+    /// handshake re-sends it and fast rigs skip the vardiff ramp.
+    suggested_diff_bits: AtomicU64,
     /// Set on shutdown so the reader loop exits instead of reconnecting.
     shutdown: AtomicBool,
     /// Live telemetry shared with the mining loop and the loopback stats server.
@@ -116,7 +122,57 @@ impl Shared {
     fn difficulty(&self) -> f64 {
         f64::from_bits(self.difficulty_bits.load(Ordering::Relaxed))
     }
+    /// Cache the difficulty to hint via `mining.suggest_difficulty` on future
+    /// (re)connect handshakes. Ignores non-positive/non-finite values.
+    fn set_suggested_diff(&self, d: f64) {
+        if d.is_finite() && d > 0.0 {
+            self.suggested_diff_bits.store(d.to_bits(), Ordering::Relaxed);
+        }
+    }
+    /// The cached suggestion, or `None` if none has been measured yet.
+    fn suggested_diff(&self) -> Option<f64> {
+        let bits = self.suggested_diff_bits.load(Ordering::Relaxed);
+        if bits == 0 {
+            return None;
+        }
+        let d = f64::from_bits(bits);
+        (d.is_finite() && d > 0.0).then_some(d)
+    }
 }
+
+/// Extract the numeric reject code from a Stratum error payload. The pool sends
+/// `[code, "message", data]` (e.g. `[21, "Job not found", null]`) on a rejected
+/// `mining.submit`; code 21 is the conventional "stale/job-not-found". Returns
+/// `None` when the error is absent or not in that shape.
+fn stratum_reject_code(error: &serde_json::Value) -> Option<i64> {
+    error.as_array()?.first()?.as_i64()
+}
+
+/// Convert a measured hashrate (hashes/sec) into a Stratum share difficulty that
+/// targets roughly `target_secs` seconds per share. A share at difficulty `D`
+/// takes ~`D * 2^32` hashes, so `D = hps * target_secs / 2^32`. Returns `None`
+/// for a garbage reading (non-finite or <= 0). The result is capped to
+/// `[1.0, SUGGEST_DIFF_CAP]` as client-side defense in depth — the pool also
+/// clamps to its own vardiff bounds, so a bad benchmark can never request an
+/// unsolvable difficulty.
+pub fn suggested_difficulty_from_hps(hps: f64, target_secs: f64) -> Option<f64> {
+    if !hps.is_finite() || hps <= 0.0 || !target_secs.is_finite() || target_secs <= 0.0 {
+        return None;
+    }
+    let d = hps * target_secs / 4_294_967_296.0; // 2^32
+    if !d.is_finite() || d <= 0.0 {
+        return None;
+    }
+    Some(d.clamp(1.0, SUGGEST_DIFF_CAP))
+}
+
+/// Upper bound for a client difficulty hint (defense in depth; the pool clamps
+/// to its own vardiff max regardless).
+const SUGGEST_DIFF_CAP: f64 = 4_000_000.0;
+
+/// Seconds-per-share the startup hint aims for (matches the pool's vardiff
+/// target so the pool settles near the hint instead of retargeting away).
+pub const SUGGEST_TARGET_SECS: f64 = 12.0;
 
 /// A connected Stratum v1 client.
 pub struct StratumClient {
@@ -195,7 +251,10 @@ impl StratumClient {
         stats: Arc<MinerStats>,
         endpoints: Vec<String>,
     ) -> Result<Self> {
-        let hs = Self::handshake(endpoint, worker_addr)
+        // First connect: no hashrate measured yet, so no difficulty hint. The
+        // mining loop measures it and calls `suggest_difficulty()`, which also
+        // caches it for every subsequent reconnect handshake.
+        let hs = Self::handshake(endpoint, worker_addr, None)
             .with_context(|| format!("stratum handshake to {endpoint}"))?;
 
         let shared = Arc::new(Shared {
@@ -203,6 +262,7 @@ impl StratumClient {
             difficulty_bits: AtomicU64::new(1.0f64.to_bits()),
             extranonce1_hex: Mutex::new(hs.subscribe.extranonce1_hex.clone()),
             extranonce2_size: AtomicU64::new(hs.subscribe.extranonce2_size as u64),
+            suggested_diff_bits: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             stats,
         });
@@ -262,7 +322,11 @@ impl StratumClient {
     /// One full TCP connect + subscribe + authorize round. Used by both the
     /// initial `connect()` and the reader's reconnect path. Leaves the read
     /// timeout set on the returned stream so subsequent reads can't hang.
-    fn handshake(endpoint: &str, worker_addr: &str) -> Result<Handshake> {
+    fn handshake(
+        endpoint: &str,
+        worker_addr: &str,
+        suggest_diff: Option<f64>,
+    ) -> Result<Handshake> {
         let addr = endpoint
             .to_socket_addrs()
             .with_context(|| format!("resolving stratum endpoint {endpoint}"))?
@@ -302,6 +366,20 @@ impl StratumClient {
             .write_all(serialize_line(&auth_req)?.as_bytes())
             .context("sending mining.authorize")?;
         writer.flush().ok();
+
+        // --- mining.suggest_difficulty (optional) ---
+        // A client hint so the pool starts us near our real hashrate instead of
+        // ramping vardiff up from its minimum. `None` on the very first connect
+        // (hashrate not measured yet); populated from Shared on every reconnect.
+        if let Some(d) = suggest_diff {
+            let sug = suggest_difficulty_request(d);
+            // Best-effort: a failure here must not abort an otherwise-good
+            // handshake — the pool would just start us on its default ramp.
+            if let Ok(line) = serialize_line(&sug) {
+                let _ = writer.write_all(line.as_bytes());
+                writer.flush().ok();
+            }
+        }
 
         // Read frames until we've captured both the subscribe result and the
         // authorize result. The bridge may interleave a notify/set_difficulty
@@ -533,6 +611,30 @@ impl StratumClient {
         self.shared.stats.on_share_submitted();
         Ok(())
     }
+
+    /// Hint the pool at our real difficulty via `mining.suggest_difficulty`.
+    /// Called once by the mining loop after it has a genuine hashrate reading:
+    /// caches the value so every future reconnect handshake re-sends it (no more
+    /// vardiff ramp after a drop), and sends it now on the live connection so the
+    /// current session benefits too. Best-effort — a write error is ignored (the
+    /// pool just keeps us on its default vardiff). Non-finite/<=0 is dropped.
+    pub fn suggest_difficulty(&self, difficulty: f64) {
+        if !difficulty.is_finite() || difficulty <= 0.0 {
+            return;
+        }
+        self.shared.set_suggested_diff(difficulty);
+        let req = suggest_difficulty_request(difficulty);
+        if let Ok(line) = serialize_line(&req) {
+            if let Ok(mut w) = self.writer.lock() {
+                let _ = w.write_all(line.as_bytes());
+                let _ = w.flush();
+            }
+        }
+        tracing::info!(
+            "stratum: suggested start difficulty {:.0} (from measured hashrate)",
+            difficulty
+        );
+    }
 }
 
 impl Drop for StratumClient {
@@ -572,7 +674,17 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                     match ack.result {
                         Some(true) => shared.stats.on_share_accepted(),
                         _ => {
-                            shared.stats.on_share_rejected();
+                            // Stratum reject code 21 ("stale"/"job not found") is
+                            // valid work that lost the tip race — count it apart
+                            // from real rejects so a rig can tell "too slow"
+                            // (stale) from "wrong" (rejected). `on_share_stale`
+                            // still bumps the rejected total.
+                            let is_stale = stratum_reject_code(&ack.error) == Some(21);
+                            if is_stale {
+                                shared.stats.on_share_stale();
+                            } else {
+                                shared.stats.on_share_rejected();
+                            }
                             // Emit a visible warning so headless operators
                             // (HiveOS/systemd) see rejects in the log rather
                             // than only in the counters. Include the pool's
@@ -582,11 +694,12 @@ fn dispatch_frame(line: &str, shared: &Shared) {
                             } else {
                                 format!(" (pool error: {})", ack.error)
                             };
-                            let accepted = shared.stats.snapshot().shares_accepted;
-                            let rejected = shared.stats.snapshot().shares_rejected;
+                            let snap = shared.stats.snapshot();
+                            let label = if is_stale { "STALE" } else { "REJECTED" };
                             tracing::warn!(
-                                "stratum: share REJECTED{err_detail} \
-                                 [accepted={accepted} rejected={rejected}]"
+                                "stratum: share {label}{err_detail} \
+                                 [accepted={} rejected={} stale={}]",
+                                snap.shares_accepted, snap.shares_rejected, snap.shares_stale
                             );
                         }
                     }
@@ -758,7 +871,7 @@ fn reconnect(
         let idx = endpoint_idx.load(Ordering::Relaxed);
         let endpoint = &endpoints[idx];
 
-        match StratumClient::handshake(endpoint, worker_addr) {
+        match StratumClient::handshake(endpoint, worker_addr, shared.suggested_diff()) {
             Ok(hs) => {
                 // Refresh session params the bridge may have rotated.
                 if let Ok(mut x) = shared.extranonce1_hex.lock() {
@@ -789,6 +902,7 @@ fn reconnect(
                 endpoint_idx.store(0, Ordering::Relaxed);
                 *backoff = BACKOFF_MIN;
                 shared.stats.set_connected(true);
+                shared.stats.on_reconnect();
                 tracing::info!("stratum: reconnected to {endpoint}");
                 return true;
             }
@@ -849,6 +963,54 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
 
+    #[test]
+    fn suggested_difficulty_maps_hashrate_to_target() {
+        // ~10 GH/s at a 12s target ⇒ D = 10e9*12/2^32 ≈ 27.9.
+        let d = suggested_difficulty_from_hps(10e9, 12.0).unwrap();
+        assert!((d - 27.9).abs() < 0.5, "got {d}");
+        // A modest CPU rig (~20 MH/s) floors at the min difficulty 1.0.
+        assert_eq!(suggested_difficulty_from_hps(20e6, 12.0).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn suggested_difficulty_rejects_and_caps_garbage() {
+        // Non-finite / non-positive readings produce no hint.
+        assert!(suggested_difficulty_from_hps(f64::NAN, 12.0).is_none());
+        assert!(suggested_difficulty_from_hps(f64::INFINITY, 12.0).is_none());
+        assert!(suggested_difficulty_from_hps(0.0, 12.0).is_none());
+        assert!(suggested_difficulty_from_hps(-5.0, 12.0).is_none());
+        assert!(suggested_difficulty_from_hps(10e9, 0.0).is_none());
+        // An absurd reading is capped, never unbounded (defense in depth vs the
+        // pool's own clamp), so it can't request an unsolvable difficulty.
+        let capped = suggested_difficulty_from_hps(1e30, 12.0).unwrap();
+        assert_eq!(capped, SUGGEST_DIFF_CAP);
+    }
+
+    #[test]
+    fn reject_code_extracts_21_for_stale() {
+        assert_eq!(
+            stratum_reject_code(&serde_json::json!([21, "Job not found", null])),
+            Some(21)
+        );
+        assert_eq!(
+            stratum_reject_code(&serde_json::json!([23, "Low difficulty", null])),
+            Some(23)
+        );
+        assert_eq!(stratum_reject_code(&serde_json::Value::Null), None);
+        assert_eq!(stratum_reject_code(&serde_json::json!("oops")), None);
+        assert_eq!(stratum_reject_code(&serde_json::json!([])), None);
+    }
+
+    #[test]
+    fn shared_suggested_diff_roundtrip() {
+        let s = fresh_shared("11223344", 4);
+        assert_eq!(s.suggested_diff(), None); // unset by default
+        s.set_suggested_diff(64.0);
+        assert_eq!(s.suggested_diff(), Some(64.0));
+        s.set_suggested_diff(f64::NAN); // ignored, keeps prior value
+        assert_eq!(s.suggested_diff(), Some(64.0));
+    }
+
     /// Build a fresh `Shared` with defaults, as `connect()` would.
     fn fresh_shared(xn1: &str, xn2_size: u64) -> Arc<Shared> {
         Arc::new(Shared {
@@ -856,6 +1018,7 @@ mod tests {
             difficulty_bits: AtomicU64::new(1.0f64.to_bits()),
             extranonce1_hex: Mutex::new(xn1.to_string()),
             extranonce2_size: AtomicU64::new(xn2_size),
+            suggested_diff_bits: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             stats: Arc::new(MinerStats::new()),
         })
@@ -987,7 +1150,7 @@ mod tests {
             sock.flush().unwrap();
             std::thread::sleep(Duration::from_millis(100));
         });
-        let err = match StratumClient::handshake(&addr.to_string(), "csd1badaddr") {
+        let err = match StratumClient::handshake(&addr.to_string(), "csd1badaddr", None) {
             Ok(_) => panic!("handshake must fail on an authorize rejection"),
             Err(e) => e,
         };
@@ -1019,7 +1182,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().unwrap();
         drop(listener); // port now refuses connections
-        let err = match StratumClient::handshake(&addr.to_string(), "csd1worker") {
+        let err = match StratumClient::handshake(&addr.to_string(), "csd1worker", None) {
             Ok(_) => panic!("connect to a closed port must fail"),
             Err(e) => e,
         };

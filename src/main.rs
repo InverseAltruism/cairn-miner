@@ -111,6 +111,13 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     device: usize,
 
+    /// Disable the startup difficulty hint. By default the miner measures its
+    /// hashrate and sends `mining.suggest_difficulty` so the pool starts it near
+    /// its true difficulty instead of ramping up from the minimum after every
+    /// (re)connect. Set this only for a pool that mishandles the hint.
+    #[arg(long, default_value_t = false)]
+    no_suggest_difficulty: bool,
+
     /// Log directory (rotates previous log on startup).
     #[arg(long, default_value = "logs")]
     log_dir: PathBuf,
@@ -280,6 +287,7 @@ fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
         return MiningConfig {
             cpu_threads: 0,
             cpu_share: 0.0,
+            suggest_difficulty: !cli.no_suggest_difficulty,
         };
     }
     let max_threads = num_cpus_default();
@@ -288,6 +296,7 @@ fn build_mining_config(cli: &Cli, backend_is_cpu: bool) -> MiningConfig {
     MiningConfig {
         cpu_threads,
         cpu_share,
+        suggest_difficulty: !cli.no_suggest_difficulty,
     }
 }
 

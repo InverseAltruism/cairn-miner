@@ -12,6 +12,11 @@ pub struct MiningConfig {
     /// 0.0 disables CPU mining; 1.0 gives the GPU nothing. A useful range
     /// is roughly 0.2..0.5 depending on the CPU/GPU mix.
     pub cpu_share: f32,
+    /// When true (default), the mining loop measures the rig's hashrate and
+    /// sends `mining.suggest_difficulty` so the pool starts us near our true
+    /// difficulty instead of ramping vardiff up from its minimum. Disable with
+    /// `--no-suggest-difficulty` for a pool that mishandles the hint.
+    pub suggest_difficulty: bool,
 }
 
 impl Default for MiningConfig {
@@ -20,6 +25,7 @@ impl Default for MiningConfig {
         Self {
             cpu_threads: 0,
             cpu_share: 0.0,
+            suggest_difficulty: true,
         }
     }
 }

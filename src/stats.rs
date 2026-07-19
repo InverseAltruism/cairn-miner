@@ -25,6 +25,14 @@ pub struct MinerStats {
     shares_submitted: AtomicU64,
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
+    /// Shares the pool rejected specifically as stale (reject code 21) — work
+    /// that was valid but arrived after the tip moved. Tracked apart from
+    /// `shares_rejected` so a rig can tell "too slow / bad tuning" (stale) from
+    /// "wrong / low-diff" (rejected).
+    shares_stale: AtomicU64,
+    /// Count of successful reconnects to the pool after a drop (0 = the link has
+    /// held since startup). A climbing value points at a flaky network/pool.
+    reconnects: AtomicU64,
     /// Unix seconds of the most recent accepted share (0 = none yet).
     last_share_unix: AtomicU64,
     pool: Mutex<String>,
@@ -49,6 +57,8 @@ impl MinerStats {
             shares_submitted: AtomicU64::new(0),
             shares_accepted: AtomicU64::new(0),
             shares_rejected: AtomicU64::new(0),
+            shares_stale: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
             last_share_unix: AtomicU64::new(0),
             pool: Mutex::new(String::new()),
             worker: Mutex::new(String::new()),
@@ -84,6 +94,18 @@ impl MinerStats {
 
     pub fn on_share_rejected(&self) {
         self.shares_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A share the pool rejected as stale (reject code 21). Counted here AND in
+    /// `shares_rejected` so `shares_rejected` stays the total-rejected figure.
+    pub fn on_share_stale(&self) {
+        self.shares_stale.fetch_add(1, Ordering::Relaxed);
+        self.shares_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A successful reconnect after the pool link dropped.
+    pub fn on_reconnect(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One-time descriptive metadata for the dashboard header.
@@ -123,6 +145,8 @@ impl MinerStats {
             shares_submitted: self.shares_submitted.load(Ordering::Relaxed),
             shares_accepted: self.shares_accepted.load(Ordering::Relaxed),
             shares_rejected: self.shares_rejected.load(Ordering::Relaxed),
+            shares_stale: self.shares_stale.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
             last_share_age_secs: last_age,
             pool: self.pool.lock().map(|g| g.clone()).unwrap_or_default(),
             worker: self.worker.lock().map(|g| g.clone()).unwrap_or_default(),
@@ -145,6 +169,8 @@ pub struct StatsSnapshot {
     pub shares_submitted: u64,
     pub shares_accepted: u64,
     pub shares_rejected: u64,
+    pub shares_stale: u64,
+    pub reconnects: u64,
     pub last_share_age_secs: Option<u64>,
     pub pool: String,
     pub worker: String,
@@ -213,10 +239,25 @@ mod tests {
             "hashrate_total_hps",
             "shares_accepted",
             "shares_rejected",
+            "shares_stale",
+            "reconnects",
             "backend",
             "version",
         ] {
             assert!(json.contains(key), "missing key {key} in {json}");
         }
+    }
+
+    #[test]
+    fn stale_counts_apart_from_but_within_rejected() {
+        let s = MinerStats::new();
+        s.on_share_rejected(); // a plain reject
+        s.on_share_stale(); // a stale (bumps stale AND the rejected total)
+        let snap = s.snapshot();
+        assert_eq!(snap.shares_stale, 1);
+        assert_eq!(snap.shares_rejected, 2); // total rejected includes the stale
+        s.on_reconnect();
+        s.on_reconnect();
+        assert_eq!(s.snapshot().reconnects, 2);
     }
 }

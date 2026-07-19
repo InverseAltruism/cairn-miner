@@ -30,7 +30,7 @@ use crate::backend::{HashOutcome, MiningBackend, MiningResult};
 use crate::coinbase::{coinbase_txid, header_84, merkle_root_from_branch};
 use crate::mining_config::{partition_nonce_range, MiningConfig};
 use crate::sha256d_cpu::{finish_sha256d_from_midstate_fast, midstate_of_first_chunk_fast};
-use crate::stratum::client::StratumClient;
+use crate::stratum::client::{suggested_difficulty_from_hps, StratumClient, SUGGEST_TARGET_SECS};
 use crate::stratum::mapping::{build_submit, compose_extranonce, notify_to_template};
 
 /// Pool-difficulty-1 target as 32 big-endian bytes:
@@ -169,6 +169,11 @@ pub fn run_stratum<B: MiningBackend>(
     let mut last_hps_pub = Instant::now();
     let mut gpu_nonces_since_pub: u128 = 0;
     let mut cpu_nonces_since_pub: u128 = 0;
+    // One-shot: once we have a genuine hashrate reading, hint the pool at our
+    // real difficulty (`mining.suggest_difficulty`) so it starts us there
+    // instead of ramping vardiff up from the minimum. The client caches it so
+    // every reconnect re-sends it. Disabled by `--no-suggest-difficulty`.
+    let mut suggested_difficulty = !cfg.suggest_difficulty; // true = already done / skip
 
     // Rate-limit the "waiting for first job" notice so a slow pool start
     // doesn't spam the log.
@@ -534,13 +539,21 @@ pub fn run_stratum<B: MiningBackend>(
             cpu_nonces_since_pub = cpu_nonces_since_pub.saturating_add(cpu_swept_n);
             if last_hps_pub.elapsed() >= Duration::from_secs(2) {
                 let el = last_hps_pub.elapsed().as_secs_f64().max(1e-6);
-                stats.set_hps(
-                    gpu_nonces_since_pub as f64 / el,
-                    cpu_nonces_since_pub as f64 / el,
-                );
+                let gpu_hps = gpu_nonces_since_pub as f64 / el;
+                let cpu_hps = cpu_nonces_since_pub as f64 / el;
+                stats.set_hps(gpu_hps, cpu_hps);
                 gpu_nonces_since_pub = 0;
                 cpu_nonces_since_pub = 0;
                 last_hps_pub = Instant::now();
+
+                // First real reading → hint the pool at our difficulty (once).
+                if !suggested_difficulty {
+                    let total_hps = gpu_hps + cpu_hps;
+                    if let Some(d) = suggested_difficulty_from_hps(total_hps, SUGGEST_TARGET_SECS) {
+                        client.suggest_difficulty(d);
+                        suggested_difficulty = true;
+                    }
+                }
             }
 
             enum WinSource {
@@ -995,6 +1008,7 @@ mod tests {
             let cfg = MiningConfig {
                 cpu_threads: 0,
                 cpu_share: 0.0,
+                suggest_difficulty: false,
             };
             run_stratum(&backend, &client, stop_for_loop, cfg)
         });
@@ -1100,6 +1114,7 @@ mod tests {
         let cfg = MiningConfig {
             cpu_threads: 0,
             cpu_share: 0.0,
+            suggest_difficulty: false,
         };
         let result = run_stratum(&backend, &client, stop, cfg);
 

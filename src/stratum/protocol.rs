@@ -177,6 +177,20 @@ pub fn authorize_request(id: u64, worker: &str) -> Request {
     }
 }
 
+/// Build a `mining.suggest_difficulty` request: `[difficulty]`. A client hint
+/// sent right after authorize so the pool can start us near our real hashrate
+/// instead of ramping vardiff up from its minimum after every (re)connect. Sent
+/// with `id: null` per Stratum convention — the pool applies it once and does
+/// not ack it (our pool clamps it to its own vardiff bounds, so an over-large
+/// hint can never request an unsolvable difficulty).
+pub fn suggest_difficulty_request(difficulty: f64) -> Request {
+    Request {
+        id: None,
+        method: "mining.suggest_difficulty".to_string(),
+        params: serde_json::json!([difficulty]),
+    }
+}
+
 /// Build a `mining.submit` request carrying the 5-tuple
 /// `[worker, job_id, extranonce2_hex, ntime_hex, nonce_hex]`.
 pub fn submit_request(
@@ -331,6 +345,20 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(p[0], "csd1addr");
         assert_eq!(p[1], "x");
+    }
+
+    #[test]
+    fn suggest_difficulty_request_shape() {
+        let req = suggest_difficulty_request(1024.0);
+        assert_eq!(req.method, "mining.suggest_difficulty");
+        assert_eq!(req.id, None); // null id per convention: no ack expected
+        let p = req.params.as_array().unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].as_f64().unwrap(), 1024.0);
+        // serializes to a single valid line with an explicit null id
+        let line = serialize_line(&req).unwrap();
+        assert!(line.contains("mining.suggest_difficulty"));
+        assert!(line.contains("\"id\":null"));
     }
 
     #[test]
