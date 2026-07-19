@@ -174,6 +174,10 @@ pub fn run_stratum<B: MiningBackend>(
     // instead of ramping vardiff up from the minimum. The client caches it so
     // every reconnect re-sends it. Disabled by `--no-suggest-difficulty`.
     let mut suggested_difficulty = !cfg.suggest_difficulty; // true = already done / skip
+    // Becomes true once the first job arrives and real hashing starts, so the
+    // first hashrate window (which feeds the one-shot suggest_difficulty hint)
+    // isn't diluted by the "waiting for first mining.notify" idle time.
+    let mut mining_started = false;
 
     // Rate-limit the "waiting for first job" notice so a slow pool start
     // doesn't spam the log.
@@ -287,6 +291,16 @@ pub fn run_stratum<B: MiningBackend>(
                 continue;
             }
         };
+
+        // First real job in hand → start the hashrate-measurement clock here, not
+        // at loop entry, so the "waiting for notify" idle time never dilutes the
+        // window that seeds the suggest_difficulty hint.
+        if !mining_started {
+            mining_started = true;
+            last_hps_pub = Instant::now();
+            gpu_nonces_since_pub = 0;
+            cpu_nonces_since_pub = 0;
+        }
 
         // Share target from the current pool difficulty.
         let difficulty = client.current_difficulty();
