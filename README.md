@@ -43,6 +43,12 @@ Each GPU runs as its own worker under one window (no more one-console-per-card).
 > Prefer the command line? A bare `cairn-miner.exe` needs `--address <addr20>`;
 > with no address it just exits.
 
+> **First run on Windows:** the binaries aren't code-signed yet, so Windows
+> SmartScreen may show *"Windows protected your PC / unknown publisher."* Click
+> **More info → Run anyway**. (Signing is on the roadmap; until then this one-time
+> click is expected. You can confirm the download against `SHA256SUMS` on the
+> release page if you want to verify it yourself.)
+
 ### Windows (scripted install)
 
 Prefer a headless install/service instead of the GUI? Download **`install.bat`**
@@ -63,6 +69,12 @@ Flight sheet → Miner: **Custom** →
 
 That's it — standard fields, no dummy pool URL, no exact-name gotchas. Multi-GPU
 rigs are handled per card.
+
+> The HiveOS package ships the **NVIDIA/CUDA** build (the overwhelming majority of
+> HiveOS rigs). It starts on any rig and, if no NVIDIA GPU is usable, falls back to
+> CPU rather than crashing. **AMD HiveOS rigs**: the CUDA package will CPU-fall-back,
+> so use the generic Linux OpenCL binary instead — `install.sh amd` on the rig, or
+> the `cairn-miner-linux-opencl-x86_64` asset — not this package.
 
 ### No wallet yet?
 

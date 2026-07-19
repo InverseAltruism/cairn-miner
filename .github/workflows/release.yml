@@ -148,8 +148,11 @@ jobs:
       # falls back to CPU via --backend auto. We deliberately do NOT ship the
       # opencl-linked binary here: opencl-sys puts a hard DT_NEEDED on
       # libOpenCL.so.1, so that binary fails to start on any rig lacking the ICD
-      # loader — a worse default for the NVIDIA majority. (AMD HiveOS rigs: use
-      # one flight-sheet slot per card with --backend opencl for now.)
+      # loader — a worse default for the NVIDIA majority. AMD HiveOS rigs cannot
+      # use --backend opencl against THIS package (opencl isn't compiled in, it
+      # would error / CPU-fall-back); they should install the generic Linux
+      # opencl binary instead (cairn-miner-linux-opencl-x86_64 / `install.sh amd`).
+      # See the AMD note in README.md "HiveOS".
       # RELEASE GATE: a tagged release must never ship a CPU-only HiveOS
       # tarball — every NVIDIA rig on the farm would silently mine at CPU
       # speed. The CUDA build step stays continue-on-error so untagged
