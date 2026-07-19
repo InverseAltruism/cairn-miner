@@ -273,17 +273,38 @@ impl MiningBackend for CudaBackend {
             if stop.load(Ordering::Relaxed) {
                 return None;
             }
-            let pipe: &mut PipeRes = if current_pipe == 0 { &mut *a } else { &mut *b };
 
-            // Drain if in flight.
-            if pipe.in_flight {
-                if let Some(res) = drain_pipe(pipe) {
-                    return Some(res);
+            // Drain the current pipe if in flight. Reset `in_flight` BEFORE
+            // using the result: the old code returned with the flag left true,
+            // so this pipe's found buffer (found_flag=1, found_nonce=X) leaked
+            // into the next hash_range call, which re-drained it and re-submitted
+            // the SAME nonce — the duplicate-share bug. It only surfaced at low
+            // difficulty, where nearly every chunk finds and so the reset path
+            // (drain -> None) never ran; fast cards at high diff cleared it every
+            // launch and never saw it. The OpenCL backend already does this.
+            let drain_result = {
+                let pipe: &mut PipeRes = if current_pipe == 0 { &mut *a } else { &mut *b };
+                if pipe.in_flight {
+                    let res = drain_pipe(pipe);
+                    pipe.in_flight = false;
+                    res
+                } else {
+                    None
                 }
-                pipe.in_flight = false;
+            };
+            if let Some(res) = drain_result {
+                // Drain the sibling too so its abandoned in-flight launch can't
+                // leak into the next call either.
+                let other: &mut PipeRes = if current_pipe == 0 { &mut *b } else { &mut *a };
+                if other.in_flight {
+                    let _ = drain_pipe(other);
+                    other.in_flight = false;
+                }
+                return Some(res);
             }
 
             if next_start < nonce_end as u64 {
+                let pipe: &mut PipeRes = if current_pipe == 0 { &mut *a } else { &mut *b };
                 let launch_size = nonces_per_launch.min(nonce_end as u64 - next_start);
                 if launch_size > 0 {
                     let start_u32 = next_start as u32;
